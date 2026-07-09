@@ -1,0 +1,20 @@
+<launch>
+  <!-- Launch file for Phase 1: RGB color region detection and contour extraction -->
+
+  <!-- Input color image topic from OrbbecSDK_ROS1 -->
+  <arg name="input_topic" default="/camera/color/image_raw"/>
+
+  <!-- Namespace for detector output topics -->
+  <arg name="output_ns" default="gemini_geometry_detector"/>
+
+  <!-- Path to HSV threshold config file -->
+  <arg name="config_file"
+       default="$(find gemini_geometry_detector)/config/color_thresholds.yaml"/>
+
+  <group ns="$(arg output_ns)">
+    <node name="color_region_detector" pkg="gemini_geometry_detector" type="color_region_detector_node" output="screen">
+      <param name="input_topic" value="$(arg input_topic)"/>
+      <rosparam file="$(arg config_file)" command="load"/>
+    </node>
+  </group>
+</launch>
