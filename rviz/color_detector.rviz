@@ -1,0 +1,99 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Status1
+        - /Annotated1
+        - /Mask1
+      Splitter Ratio: 0.5
+    Tree Height: 549
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Class: rviz/Image
+      Image Topic: /gemini_geometry_detector/color/annotated
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Annotated
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Unreliable: false
+      Value: true
+    - Alpha: 0.5
+      Class: rviz/Image
+      Image Topic: /gemini_geometry_detector/color/mask
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Mask
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Unreliable: false
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: camera_color_optical_frame
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Name: Interact
+    - Class: rviz/MoveCamera
+      Name: MoveCamera
+    - Class: rviz/Select
+      Name: Select
+    - Class: rviz/FocusCamera
+      Name: FocusCamera
+    - Class: rviz/Measure
+      Name: Measure
+    - Class: rviz/SetInitialPose
+      Name: 2D Pose Estimate
+    - Class: rviz/SetGoal
+      Name: 2D Nav Goal
+    - Class: rviz/PublishPoint
+      Name: Publish Point
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 10
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.7853981852531433
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
+      Yaw: 0.7853981852531433
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 800
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1200
+  X: 100
+  Y: 100

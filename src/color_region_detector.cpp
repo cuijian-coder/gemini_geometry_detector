@@ -1,6 +1,4 @@
 #include "gemini_geometry_detector/color_region_detector.h"
-#include "gemini_geometry_detector/ContourArray.h"
-#include "gemini_geometry_detector/ContourInfo.h"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
@@ -9,7 +7,7 @@ namespace gemini_geometry_detector
 {
 
 ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& pnh)
-  : nh_(nh), pnh_(pnh), it_(nh), has_image_(false)
+  : nh_(nh), pnh_(pnh), it_(nh), has_image_(false), first_image_received_(false), first_image_processed_(false)
 {
   loadParameters();
 
@@ -23,6 +21,8 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
   ROS_INFO("ColorRegionDetector started.");
   ROS_INFO("Input topic: %s", input_topic_.c_str());
   ROS_INFO("HSV range: H[%d,%d] S[%d,%d] V[%d,%d]", h_min_, h_max_, s_min_, s_max_, v_min_, v_max_);
+  ROS_INFO("Morph kernel size: %d, min contour area: %d, max contour points: %d",
+           morph_kernel_size_, min_contour_area_, max_contour_points_);
   ROS_INFO("Process rate: %.1f Hz", process_rate_);
 }
 
@@ -52,9 +52,21 @@ void ColorRegionDetector::loadParameters()
 
 void ColorRegionDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
 {
-  std::lock_guard<std::mutex> lock(image_mutex_);
-  latest_image_ = msg;
-  has_image_ = true;
+  {
+    std::lock_guard<std::mutex> lock(image_mutex_);
+    latest_image_ = msg;
+    has_image_ = true;
+  }
+
+  if (!first_image_received_)
+  {
+    ROS_INFO("First color image received: %dx%d, encoding: %s, frame_id: %s",
+             msg->width, msg->height, msg->encoding.c_str(), msg->header.frame_id.c_str());
+    first_image_received_ = true;
+  }
+
+  ROS_DEBUG("Received color image: %dx%d, encoding: %s, stamp: %.3f",
+            msg->width, msg->height, msg->encoding.c_str(), msg->header.stamp.toSec());
 }
 
 void ColorRegionDetector::timerCallback(const ros::TimerEvent& event)
@@ -64,122 +76,205 @@ void ColorRegionDetector::timerCallback(const ros::TimerEvent& event)
 
 void ColorRegionDetector::processLatestImage()
 {
-  sensor_msgs::ImageConstPtr image_msg;
+  sensor_msgs::ImageConstPtr image_msg = getLatestImage();
+  if (!image_msg)
   {
-    std::lock_guard<std::mutex> lock(image_mutex_);
-    if (!has_image_)
-    {
-      return;
-    }
-    image_msg = latest_image_;
-  }
-
-  cv_bridge::CvImageConstPtr cv_ptr;
-  try
-  {
-    cv_ptr = cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
   }
 
-  cv::Mat hsv;
-  cv::cvtColor(cv_ptr->image, hsv, cv::COLOR_BGR2HSV);
-
-  cv::Mat mask;
-  cv::inRange(hsv, cv::Scalar(h_min_, s_min_, v_min_), cv::Scalar(h_max_, s_max_, v_max_), mask);
-
-  if (morph_kernel_size_ > 0)
+  cv_bridge::CvImageConstPtr cv_ptr = convertToCvImage(image_msg);
+  if (!cv_ptr)
   {
-    cv::Mat element = cv::getStructuringElement(
-        cv::MORPH_ELLIPSE, cv::Size(morph_kernel_size_, morph_kernel_size_));
-    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, element);
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, element);
+    return;
   }
 
-  // Find contours
+  if (!first_image_processed_)
+  {
+    ROS_INFO("First image is being processed: %dx%d, encoding: %s",
+             cv_ptr->image.cols, cv_ptr->image.rows, image_msg->encoding.c_str());
+    first_image_processed_ = true;
+  }
+
+  cv::Mat mask = createColorMask(cv_ptr->image);
+  applyMorphology(mask);
+
   std::vector<std::vector<cv::Point>> contours;
-  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  detectContours(mask, contours);
 
-  // Annotated image
   cv::Mat annotated = cv_ptr->image.clone();
-
   ContourArray contour_array;
   contour_array.header = image_msg->header;
 
   int id = 0;
+  int filtered_count = 0;
   for (const auto& contour : contours)
   {
-    double area = cv::contourArea(contour);
-    if (area < min_contour_area_)
+    ContourInfo info;
+    if (buildContourInfo(contour, id++, info))
     {
-      continue;
-    }
-
-    cv::Moments m = cv::moments(contour);
-    cv::Point2f center;
-    if (m.m00 > 0)
-    {
-      center.x = static_cast<float>(m.m10 / m.m00);
-      center.y = static_cast<float>(m.m01 / m.m00);
+      drawContourOnImage(annotated, contour, info);
+      contour_array.contours.push_back(info);
     }
     else
     {
-      center = cv::Point2f(0, 0);
+      ++filtered_count;
     }
-
-    cv::Rect bbox = cv::boundingRect(contour);
-
-    // Draw on annotated image
-    cv::drawContours(annotated, std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(0, 255, 0), 2);
-    cv::circle(annotated, center, 4, cv::Scalar(0, 0, 255), -1);
-    cv::rectangle(annotated, bbox, cv::Scalar(255, 0, 0), 2);
-
-    // Fill message
-    ContourInfo info;
-    info.id = id++;
-    info.center.x = center.x;
-    info.center.y = center.y;
-    info.center.z = 0.0;
-    info.area = area;
-    info.bbox_tl.x = bbox.x;
-    info.bbox_tl.y = bbox.y;
-    info.bbox_tl.z = 0.0;
-    info.bbox_br.x = bbox.x + bbox.width;
-    info.bbox_br.y = bbox.y + bbox.height;
-    info.bbox_br.z = 0.0;
-
-    // Downsample contour points if needed
-    size_t step = 1;
-    if (max_contour_points_ > 0 && contour.size() > static_cast<size_t>(max_contour_points_))
-    {
-      step = contour.size() / max_contour_points_;
-      if (step < 1) step = 1;
-    }
-    for (size_t i = 0; i < contour.size(); i += step)
-    {
-      geometry_msgs::Point32 p;
-      p.x = contour[i].x;
-      p.y = contour[i].y;
-      p.z = 0.0f;
-      info.points.push_back(p);
-    }
-
-    contour_array.contours.push_back(info);
   }
+
+  ROS_INFO_THROTTLE(1.0,
+                    "Image %dx%d, raw contours: %zu, valid: %zu, filtered by area: %d",
+                    cv_ptr->image.cols, cv_ptr->image.rows,
+                    contours.size(), contour_array.contours.size(), filtered_count);
+
+  publishResults(image_msg->header, mask, annotated, contour_array);
+}
+
+sensor_msgs::ImageConstPtr ColorRegionDetector::getLatestImage()
+{
+  std::lock_guard<std::mutex> lock(image_mutex_);
+  if (!has_image_)
+  {
+    ROS_WARN_THROTTLE(5.0, "No color image received yet on topic: %s", input_topic_.c_str());
+    return sensor_msgs::ImageConstPtr();
+  }
+  return latest_image_;
+}
+
+cv_bridge::CvImageConstPtr ColorRegionDetector::convertToCvImage(const sensor_msgs::ImageConstPtr& image_msg)
+{
+  try
+  {
+    auto cv_ptr = cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
+    ROS_DEBUG("cv_bridge conversion OK: %dx%d, channels: %d",
+              cv_ptr->image.cols, cv_ptr->image.rows, cv_ptr->image.channels());
+    return cv_ptr;
+  }
+  catch (cv_bridge::Exception& e)
+  {
+    ROS_ERROR("cv_bridge exception: %s (encoding: %s)", e.what(), image_msg->encoding.c_str());
+    return cv_bridge::CvImageConstPtr();
+  }
+}
+
+cv::Mat ColorRegionDetector::createColorMask(const cv::Mat& bgr_image)
+{
+  cv::Mat hsv;
+  cv::cvtColor(bgr_image, hsv, cv::COLOR_BGR2HSV);
+
+  cv::Mat mask;
+  cv::inRange(hsv, cv::Scalar(h_min_, s_min_, v_min_), cv::Scalar(h_max_, s_max_, v_max_), mask);
+  return mask;
+}
+
+void ColorRegionDetector::applyMorphology(cv::Mat& mask)
+{
+  if (morph_kernel_size_ <= 0)
+  {
+    return;
+  }
+
+  cv::Mat element = cv::getStructuringElement(
+      cv::MORPH_ELLIPSE, cv::Size(morph_kernel_size_, morph_kernel_size_));
+  cv::morphologyEx(mask, mask, cv::MORPH_OPEN, element);
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, element);
+}
+
+void ColorRegionDetector::detectContours(const cv::Mat& mask,
+                                         std::vector<std::vector<cv::Point>>& contours)
+{
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+}
+
+bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour,
+                                           int id,
+                                           ContourInfo& info)
+{
+  double area = cv::contourArea(contour);
+  if (area < min_contour_area_)
+  {
+    return false;
+  }
+
+  cv::Moments m = cv::moments(contour);
+  cv::Point2f center(0, 0);
+  if (m.m00 > 0)
+  {
+    center.x = static_cast<float>(m.m10 / m.m00);
+    center.y = static_cast<float>(m.m01 / m.m00);
+  }
+
+  cv::Rect bbox = cv::boundingRect(contour);
+
+  info.id = id;
+  info.center.x = center.x;
+  info.center.y = center.y;
+  info.center.z = 0.0;
+  info.area = area;
+  info.bbox_tl.x = bbox.x;
+  info.bbox_tl.y = bbox.y;
+  info.bbox_tl.z = 0.0;
+  info.bbox_br.x = bbox.x + bbox.width;
+  info.bbox_br.y = bbox.y + bbox.height;
+  info.bbox_br.z = 0.0;
+
+  // Downsample contour points if needed
+  size_t step = 1;
+  if (max_contour_points_ > 0 && contour.size() > static_cast<size_t>(max_contour_points_))
+  {
+    step = contour.size() / max_contour_points_;
+    if (step < 1)
+    {
+      step = 1;
+    }
+  }
+
+  info.points.clear();
+  for (size_t i = 0; i < contour.size(); i += step)
+  {
+    geometry_msgs::Point32 p;
+    p.x = contour[i].x;
+    p.y = contour[i].y;
+    p.z = 0.0f;
+    info.points.push_back(p);
+  }
+
+  return true;
+}
+
+void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
+                                             const std::vector<cv::Point>& contour,
+                                             const ContourInfo& info)
+{
+  cv::Rect bbox(
+      static_cast<int>(info.bbox_tl.x),
+      static_cast<int>(info.bbox_tl.y),
+      static_cast<int>(info.bbox_br.x - info.bbox_tl.x),
+      static_cast<int>(info.bbox_br.y - info.bbox_tl.y));
+
+  cv::drawContours(annotated, std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(0, 255, 0), 2);
+  cv::circle(annotated, cv::Point(static_cast<int>(info.center.x), static_cast<int>(info.center.y)),
+             4, cv::Scalar(0, 0, 255), -1);
+  cv::rectangle(annotated, bbox, cv::Scalar(255, 0, 0), 2);
+}
+
+void ColorRegionDetector::publishResults(const std_msgs::Header& header,
+                                         const cv::Mat& mask,
+                                         const cv::Mat& annotated,
+                                         const ContourArray& contour_array)
+{
+  ROS_DEBUG("Publishing mask (%dx%d), annotated image (%dx%d) and %zu contours",
+            mask.cols, mask.rows, annotated.cols, annotated.rows, contour_array.contours.size());
 
   // Publish mask
   cv_bridge::CvImage mask_msg;
-  mask_msg.header = image_msg->header;
+  mask_msg.header = header;
   mask_msg.encoding = sensor_msgs::image_encodings::MONO8;
   mask_msg.image = mask;
   mask_pub_.publish(mask_msg.toImageMsg());
 
   // Publish annotated image
   cv_bridge::CvImage annotated_msg;
-  annotated_msg.header = image_msg->header;
+  annotated_msg.header = header;
   annotated_msg.encoding = sensor_msgs::image_encodings::BGR8;
   annotated_msg.image = annotated;
   annotated_pub_.publish(annotated_msg.toImageMsg());

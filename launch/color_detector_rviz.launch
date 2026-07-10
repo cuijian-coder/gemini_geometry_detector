@@ -1,0 +1,22 @@
+<launch>
+  <!--
+    Launch color region detector together with RViz.
+    Use this when the camera driver (or bag) is already publishing /camera/color/image_raw.
+  -->
+
+  <arg name="input_topic" default="/camera/color/image_raw"/>
+  <arg name="config_file"
+       default="$(find gemini_geometry_detector)/config/color_thresholds.yaml"/>
+  <arg name="rviz_config"
+       default="$(find gemini_geometry_detector)/rviz/color_detector.rviz"/>
+
+  <!-- Color region detector -->
+  <include file="$(find gemini_geometry_detector)/launch/color_detector.launch">
+    <arg name="input_topic" value="$(arg input_topic)"/>
+    <arg name="config_file" value="$(arg config_file)"/>
+  </include>
+
+  <!-- RViz -->
+  <node name="color_detector_rviz" pkg="rviz" type="rviz"
+        args="-d $(arg rviz_config)"/>
+</launch>
