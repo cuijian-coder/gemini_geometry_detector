@@ -1,0 +1,33 @@
+# HSV threshold for yellow ground line detection
+# Note: these values are a starting point; tune them with your actual lighting.
+
+# HSV lower bound (H: 0-179, S: 0-255, V: 0-255)
+h_min: 20
+s_min: 80
+v_min: 80
+
+# HSV upper bound
+h_max: 40
+s_max: 255
+v_max: 255
+
+# Morphological operation kernel size (odd number, 0 to disable)
+morph_kernel_size: 5
+
+# Minimum contour area in pixels to be considered valid
+min_contour_area: 200
+
+# Maximum number of contour points to publish per contour (0 = all, downsample if >0)
+max_contour_points: 64
+
+# Input topics
+input_topic: /camera/color/image_raw
+depth_topic: /camera/depth/image_raw
+camera_info_topic: /camera/color/camera_info
+point_cloud_topic: /camera/depth_registered/points
+
+# Depth scale. For 16UC1 (mm) use 0.001; for 32FC1 (meters) use 1.0
+depth_scale: 0.001
+
+# Use OrbbecSDK_ROS1 point cloud instead of depth image + camera_info
+use_point_cloud: false

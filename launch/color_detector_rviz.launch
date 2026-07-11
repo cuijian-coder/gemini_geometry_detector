@@ -1,19 +1,30 @@
 <launch>
   <!--
     Launch color region detector together with RViz.
-    Use this when the camera driver (or bag) is already publishing /camera/color/image_raw.
+    Use this when the camera driver (or bag) is already publishing the required topics.
   -->
 
   <arg name="input_topic" default="/camera/color/image_raw"/>
+  <arg name="depth_topic" default="/camera/depth/image_raw"/>
+  <arg name="camera_info_topic" default="/camera/color/camera_info"/>
+  <arg name="point_cloud_topic" default="/camera/depth_registered/points"/>
+  <arg name="use_point_cloud" default="false"/>
   <arg name="config_file"
-       default="$(find gemini_geometry_detector)/config/color_thresholds.yaml"/>
+       default="$(find gemini_geometry_detector)/config/detector.yaml"/>
+  <arg name="ground_segmentation_config_file"
+       default="$(find gemini_geometry_detector)/config/ground_segmentation.yaml"/>
   <arg name="rviz_config"
        default="$(find gemini_geometry_detector)/rviz/color_detector.rviz"/>
 
   <!-- Color region detector -->
   <include file="$(find gemini_geometry_detector)/launch/color_detector.launch">
     <arg name="input_topic" value="$(arg input_topic)"/>
+    <arg name="depth_topic" value="$(arg depth_topic)"/>
+    <arg name="camera_info_topic" value="$(arg camera_info_topic)"/>
+    <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
+    <arg name="use_point_cloud" value="$(arg use_point_cloud)"/>
     <arg name="config_file" value="$(arg config_file)"/>
+    <arg name="ground_segmentation_config_file" value="$(arg ground_segmentation_config_file)"/>
   </include>
 
   <!-- RViz -->

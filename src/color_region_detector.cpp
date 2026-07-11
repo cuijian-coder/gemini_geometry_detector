@@ -1,34 +1,70 @@
 #include "gemini_geometry_detector/color_region_detector.h"
 
+#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
+#include <cmath>
 
 namespace gemini_geometry_detector
 {
 
 ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& pnh)
-  : nh_(nh), pnh_(pnh), it_(nh), has_image_(false), first_image_received_(false), first_image_processed_(false)
+  : nh_(nh), pnh_(pnh), it_(nh),
+    ground_segmenter_(pnh_.resolveName("ground_segmentation", true)),
+    first_sync_received_(false)
 {
   loadParameters();
 
-  image_sub_ = it_.subscribe(input_topic_, 1, &ColorRegionDetector::imageCallback, this);
+  depth_projector_.setDepthScale(depth_scale_);
+
   mask_pub_ = it_.advertise("color/mask", 1);
   annotated_pub_ = it_.advertise("color/annotated", 1);
   contours_pub_ = nh_.advertise<ContourArray>("color/contours", 1);
+  ground_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("color/ground_cloud", 1);
+  depth_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("color/depth_cloud", 1);
 
-  process_timer_ = nh_.createTimer(ros::Duration(1.0 / process_rate_), &ColorRegionDetector::timerCallback, this);
+  rgb_sub_filter_.subscribe(it_, input_topic_, 1);
+
+  if (use_point_cloud_)
+  {
+    cloud_sub_.subscribe(nh_, point_cloud_topic_, 1);
+    cloud_sync_.reset(new message_filters::Synchronizer<CloudSyncPolicy>(
+        CloudSyncPolicy(10), rgb_sub_filter_, cloud_sub_));
+    cloud_sync_->registerCallback(boost::bind(&ColorRegionDetector::rgbCloudCallback, this, _1, _2));
+  }
+  else
+  {
+    depth_sub_.subscribe(nh_, depth_topic_, 1);
+    info_sub_.subscribe(nh_, camera_info_topic_, 1);
+
+    sync_.reset(new message_filters::Synchronizer<SyncPolicy>(
+        SyncPolicy(10), rgb_sub_filter_, depth_sub_, info_sub_));
+    sync_->registerCallback(boost::bind(&ColorRegionDetector::rgbDepthInfoCallback, this, _1, _2, _3));
+  }
 
   ROS_INFO("ColorRegionDetector started.");
-  ROS_INFO("Input topic: %s", input_topic_.c_str());
+  ROS_INFO("RGB topic: %s", input_topic_.c_str());
+  if (use_point_cloud_)
+  {
+    ROS_INFO("PointCloud mode enabled.");
+    ROS_INFO("Point cloud topic: %s", point_cloud_topic_.c_str());
+  }
+  else
+  {
+    ROS_INFO("Depth topic: %s", depth_topic_.c_str());
+    ROS_INFO("CameraInfo topic: %s", camera_info_topic_.c_str());
+  }
   ROS_INFO("HSV range: H[%d,%d] S[%d,%d] V[%d,%d]", h_min_, h_max_, s_min_, s_max_, v_min_, v_max_);
-  ROS_INFO("Morph kernel size: %d, min contour area: %d, max contour points: %d",
-           morph_kernel_size_, min_contour_area_, max_contour_points_);
-  ROS_INFO("Process rate: %.1f Hz", process_rate_);
 }
 
 void ColorRegionDetector::loadParameters()
 {
   pnh_.param<std::string>("input_topic", input_topic_, "/camera/color/image_raw");
+  pnh_.param<std::string>("depth_topic", depth_topic_, "/camera/depth/image_raw");
+  pnh_.param<std::string>("camera_info_topic", camera_info_topic_, "/camera/color/camera_info");
+  pnh_.param<std::string>("point_cloud_topic", point_cloud_topic_, "/camera/depth_registered/points");
+  pnh_.param<bool>("use_point_cloud", use_point_cloud_, false);
 
   pnh_.param("h_min", h_min_, 20);
   pnh_.param("h_max", h_max_, 40);
@@ -40,9 +76,8 @@ void ColorRegionDetector::loadParameters()
   pnh_.param("morph_kernel_size", morph_kernel_size_, 5);
   pnh_.param("min_contour_area", min_contour_area_, 200);
   pnh_.param("max_contour_points", max_contour_points_, 64);
-  pnh_.param("process_rate", process_rate_, 10.0);
+  pnh_.param("depth_scale", depth_scale_, 0.001);
 
-  // Validate kernel size: must be positive odd
   if (morph_kernel_size_ > 0 && morph_kernel_size_ % 2 == 0)
   {
     morph_kernel_size_ += 1;
@@ -50,110 +85,178 @@ void ColorRegionDetector::loadParameters()
   }
 }
 
-void ColorRegionDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
+void ColorRegionDetector::rgbDepthInfoCallback(const sensor_msgs::ImageConstPtr& rgb_msg,
+                                               const sensor_msgs::ImageConstPtr& depth_msg,
+                                               const sensor_msgs::CameraInfoConstPtr& info_msg)
 {
+  if (!first_sync_received_)
   {
-    std::lock_guard<std::mutex> lock(image_mutex_);
-    latest_image_ = msg;
-    has_image_ = true;
+    ROS_INFO("First synced frame received: RGB %dx%d, Depth %dx%d, CameraInfo frame_id: %s",
+             rgb_msg->width, rgb_msg->height,
+             depth_msg->width, depth_msg->height,
+             info_msg->header.frame_id.c_str());
+    first_sync_received_ = true;
   }
 
-  if (!first_image_received_)
+  cv_bridge::CvImageConstPtr cv_rgb;
+  try
   {
-    ROS_INFO("First color image received: %dx%d, encoding: %s, frame_id: %s",
-             msg->width, msg->height, msg->encoding.c_str(), msg->header.frame_id.c_str());
-    first_image_received_ = true;
+    cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
   }
-
-  ROS_DEBUG("Received color image: %dx%d, encoding: %s, stamp: %.3f",
-            msg->width, msg->height, msg->encoding.c_str(), msg->header.stamp.toSec());
-}
-
-void ColorRegionDetector::timerCallback(const ros::TimerEvent& event)
-{
-  processLatestImage();
-}
-
-void ColorRegionDetector::processLatestImage()
-{
-  sensor_msgs::ImageConstPtr image_msg = getLatestImage();
-  if (!image_msg)
+  catch (cv_bridge::Exception& e)
   {
+    ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
   }
 
-  cv_bridge::CvImageConstPtr cv_ptr = convertToCvImage(image_msg);
-  if (!cv_ptr)
+  processFrame(rgb_msg, cv_rgb->image, depth_msg, info_msg);
+}
+
+void ColorRegionDetector::rgbCloudCallback(const sensor_msgs::ImageConstPtr& rgb_msg,
+                                           const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
+{
+  if (!first_sync_received_)
   {
+    ROS_INFO("First synced frame received: RGB %dx%d, Cloud %dx%d, frame_id: %s",
+             rgb_msg->width, rgb_msg->height,
+             cloud_msg->width, cloud_msg->height,
+             cloud_msg->header.frame_id.c_str());
+    first_sync_received_ = true;
+  }
+
+  cv_bridge::CvImageConstPtr cv_rgb;
+  try
+  {
+    cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
+  }
+  catch (cv_bridge::Exception& e)
+  {
+    ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
   }
 
-  if (!first_image_processed_)
-  {
-    ROS_INFO("First image is being processed: %dx%d, encoding: %s",
-             cv_ptr->image.cols, cv_ptr->image.rows, image_msg->encoding.c_str());
-    first_image_processed_ = true;
-  }
+  processFrameCloud(rgb_msg, cv_rgb->image, cloud_msg);
+}
 
-  cv::Mat mask = createColorMask(cv_ptr->image);
+void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg,
+                                       const cv::Mat& bgr_image,
+                                       const sensor_msgs::ImageConstPtr& depth_msg,
+                                       const sensor_msgs::CameraInfoConstPtr& info_msg)
+{
+  cv::Mat mask = createColorMask(bgr_image);
   applyMorphology(mask);
 
   std::vector<std::vector<cv::Point>> contours;
   detectContours(mask, contours);
 
-  cv::Mat annotated = cv_ptr->image.clone();
+  cv::Mat annotated = bgr_image.clone();
   ContourArray contour_array;
-  contour_array.header = image_msg->header;
+  contour_array.header = rgb_msg->header;
 
   int id = 0;
   int filtered_count = 0;
+
   for (const auto& contour : contours)
   {
     ContourInfo info;
-    if (buildContourInfo(contour, id++, info))
-    {
-      drawContourOnImage(annotated, contour, info);
-      contour_array.contours.push_back(info);
-    }
-    else
+    if (!buildContourInfo(contour, id, info))
     {
       ++filtered_count;
+      continue;
     }
+
+    drawContourOnImage(annotated, contour, info);
+    contour_array.contours.push_back(info);
+    ++id;
   }
+
+  // Project depth to 3D point cloud
+  depth_projector_.setCameraInfo(info_msg);
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+  if (depth_projector_.convertToPointCloud(depth_msg, cloud))
+  {
+    // Segment ground (preprocessing is done inside HybridGroundSegmenter)
+    auto result = ground_segmenter_.Run(cloud);
+
+    sensor_msgs::PointCloud2 ground_msg;
+    pcl::toROSMsg(*result.ground_cloud, ground_msg);
+    ground_msg.header = rgb_msg->header;
+    ground_msg.header.frame_id = depth_msg->header.frame_id;
+    ground_cloud_pub_.publish(ground_msg);
+
+    sensor_msgs::PointCloud2 depth_cloud_msg;
+    pcl::toROSMsg(*cloud, depth_cloud_msg);
+    depth_cloud_msg.header = rgb_msg->header;
+    depth_cloud_msg.header.frame_id = depth_msg->header.frame_id;
+    depth_cloud_pub_.publish(depth_cloud_msg);
+
+    ROS_INFO_THROTTLE(1.0,
+                      "Image %dx%d, raw contours: %zu, valid 2D: %zu, filtered: %d, "
+                      "depth cloud: %zu, ground: %zu",
+                      bgr_image.cols, bgr_image.rows,
+                      contours.size(), contour_array.contours.size(), filtered_count,
+                      cloud->size(), result.ground_cloud->size());
+  }
+  else
+  {
+    ROS_WARN_THROTTLE(1.0, "Failed to convert depth to point cloud");
+  }
+
+  publishResults(rgb_msg->header, mask, annotated, contour_array);
+}
+
+void ColorRegionDetector::processFrameCloud(const sensor_msgs::ImageConstPtr& rgb_msg,
+                                            const cv::Mat& bgr_image,
+                                            const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
+{
+  cv::Mat mask = createColorMask(bgr_image);
+  applyMorphology(mask);
+
+  std::vector<std::vector<cv::Point>> contours;
+  detectContours(mask, contours);
+
+  cv::Mat annotated = bgr_image.clone();
+  ContourArray contour_array;
+  contour_array.header = rgb_msg->header;
+
+  int id = 0;
+  int filtered_count = 0;
+
+  for (const auto& contour : contours)
+  {
+    ContourInfo info;
+    if (!buildContourInfo3DFromCloud(contour, id, info, cloud_msg))
+    {
+      ++filtered_count;
+      continue;
+    }
+
+    drawContourOnImage(annotated, contour, info);
+    contour_array.contours.push_back(info);
+    ++id;
+  }
+
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+  pcl::fromROSMsg(*cloud_msg, *cloud);
+
+  auto result = ground_segmenter_.Run(cloud);
+
+  sensor_msgs::PointCloud2 ground_msg;
+  pcl::toROSMsg(*result.ground_cloud, ground_msg);
+  ground_msg.header = rgb_msg->header;
+  ground_msg.header.frame_id = cloud_msg->header.frame_id;
+  ground_cloud_pub_.publish(ground_msg);
+
+  depth_cloud_pub_.publish(*cloud_msg);
 
   ROS_INFO_THROTTLE(1.0,
-                    "Image %dx%d, raw contours: %zu, valid: %zu, filtered by area: %d",
-                    cv_ptr->image.cols, cv_ptr->image.rows,
-                    contours.size(), contour_array.contours.size(), filtered_count);
+                    "Image %dx%d, raw contours: %zu, valid 2D: %zu, filtered: %d, "
+                    "cloud: %zu, ground: %zu",
+                    bgr_image.cols, bgr_image.rows,
+                    contours.size(), contour_array.contours.size(), filtered_count,
+                    cloud->size(), result.ground_cloud->size());
 
-  publishResults(image_msg->header, mask, annotated, contour_array);
-}
-
-sensor_msgs::ImageConstPtr ColorRegionDetector::getLatestImage()
-{
-  std::lock_guard<std::mutex> lock(image_mutex_);
-  if (!has_image_)
-  {
-    ROS_WARN_THROTTLE(5.0, "No color image received yet on topic: %s", input_topic_.c_str());
-    return sensor_msgs::ImageConstPtr();
-  }
-  return latest_image_;
-}
-
-cv_bridge::CvImageConstPtr ColorRegionDetector::convertToCvImage(const sensor_msgs::ImageConstPtr& image_msg)
-{
-  try
-  {
-    auto cv_ptr = cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
-    ROS_DEBUG("cv_bridge conversion OK: %dx%d, channels: %d",
-              cv_ptr->image.cols, cv_ptr->image.rows, cv_ptr->image.channels());
-    return cv_ptr;
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    ROS_ERROR("cv_bridge exception: %s (encoding: %s)", e.what(), image_msg->encoding.c_str());
-    return cv_bridge::CvImageConstPtr();
-  }
+  publishResults(rgb_msg->header, mask, annotated, contour_array);
 }
 
 cv::Mat ColorRegionDetector::createColorMask(const cv::Mat& bgr_image)
@@ -217,7 +320,6 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
   info.bbox_br.y = bbox.y + bbox.height;
   info.bbox_br.z = 0.0;
 
-  // Downsample contour points if needed
   size_t step = 1;
   if (max_contour_points_ > 0 && contour.size() > static_cast<size_t>(max_contour_points_))
   {
@@ -236,6 +338,61 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
     p.y = contour[i].y;
     p.z = 0.0f;
     info.points.push_back(p);
+  }
+
+  return true;
+}
+
+bool ColorRegionDetector::buildContourInfo3DFromCloud(const std::vector<cv::Point>& contour,
+                                                      int id,
+                                                      ContourInfo& info,
+                                                      const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
+{
+  if (!buildContourInfo(contour, id, info))
+  {
+    return false;
+  }
+
+  // If the cloud is unorganized, we cannot do a per-pixel lookup.
+  if (cloud_msg->height <= 1 || cloud_msg->width == 0)
+  {
+    return true;
+  }
+
+  const int u = static_cast<int>(std::round(info.center.x));
+  const int v = static_cast<int>(std::round(info.center.y));
+  if (u < 0 || u >= static_cast<int>(cloud_msg->width) ||
+      v < 0 || v >= static_cast<int>(cloud_msg->height))
+  {
+    return false;
+  }
+
+  try
+  {
+    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*cloud_msg, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*cloud_msg, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*cloud_msg, "z");
+
+    const size_t idx = static_cast<size_t>(v) * cloud_msg->width + static_cast<size_t>(u);
+    iter_x += idx;
+    iter_y += idx;
+    iter_z += idx;
+
+    const float x = *iter_x;
+    const float y = *iter_y;
+    const float z = *iter_z;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+    {
+      return false;
+    }
+
+    // Store the center depth as a hint in the otherwise 2D contour info.
+    info.center.z = z;
+  }
+  catch (const std::exception& e)
+  {
+    ROS_WARN_THROTTLE(1.0, "Failed to lookup 3D point from cloud: %s", e.what());
+    return false;
   }
 
   return true;
@@ -262,24 +419,22 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
                                          const cv::Mat& annotated,
                                          const ContourArray& contour_array)
 {
-  ROS_DEBUG("Publishing mask (%dx%d), annotated image (%dx%d) and %zu contours",
-            mask.cols, mask.rows, annotated.cols, annotated.rows, contour_array.contours.size());
+  ROS_INFO_THROTTLE(1.0,
+                    "Publishing: mask + annotated + %zu 2D contours",
+                    contour_array.contours.size());
 
-  // Publish mask
   cv_bridge::CvImage mask_msg;
   mask_msg.header = header;
   mask_msg.encoding = sensor_msgs::image_encodings::MONO8;
   mask_msg.image = mask;
   mask_pub_.publish(mask_msg.toImageMsg());
 
-  // Publish annotated image
   cv_bridge::CvImage annotated_msg;
   annotated_msg.header = header;
   annotated_msg.encoding = sensor_msgs::image_encodings::BGR8;
   annotated_msg.image = annotated;
   annotated_pub_.publish(annotated_msg.toImageMsg());
 
-  // Publish contours
   contours_pub_.publish(contour_array);
 }
 

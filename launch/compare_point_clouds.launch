@@ -1,0 +1,37 @@
+<launch>
+  <!--
+    Launch two instances of color_region_detector side-by-side:
+      - depth mode:  uses DepthProjector with depth image + camera_info
+      - cloud mode:  uses OrbbecSDK_ROS1 PointCloud2 input
+    Both publish their full depth clouds and ground clouds under different
+    namespaces so they can be compared in RViz.
+  -->
+
+  <arg name="input_topic" default="/camera/color/image_raw"/>
+  <arg name="depth_topic" default="/camera/depth/image_raw"/>
+  <arg name="camera_info_topic" default="/camera/color/camera_info"/>
+  <arg name="point_cloud_topic" default="/camera/depth_registered/points"/>
+  <arg name="rviz_config"
+       default="$(find gemini_geometry_detector)/rviz/compare_clouds.rviz"/>
+
+  <!-- Instance 1: DepthProjector mode -->
+  <include file="$(find gemini_geometry_detector)/launch/color_detector.launch">
+    <arg name="output_ns" value="gemini_geometry_detector_depth"/>
+    <arg name="use_point_cloud" value="false"/>
+    <arg name="input_topic" value="$(arg input_topic)"/>
+    <arg name="depth_topic" value="$(arg depth_topic)"/>
+    <arg name="camera_info_topic" value="$(arg camera_info_topic)"/>
+  </include>
+
+  <!-- Instance 2: Orbbec point-cloud mode -->
+  <include file="$(find gemini_geometry_detector)/launch/color_detector.launch">
+    <arg name="output_ns" value="gemini_geometry_detector_cloud"/>
+    <arg name="use_point_cloud" value="true"/>
+    <arg name="input_topic" value="$(arg input_topic)"/>
+    <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
+  </include>
+
+  <!-- RViz -->
+  <node name="compare_clouds_rviz" pkg="rviz" type="rviz"
+        args="-d $(arg rviz_config)"/>
+</launch>

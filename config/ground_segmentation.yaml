@@ -1,0 +1,21 @@
+# Hybrid ground segmenter parameters
+grid_resolution: 0.20
+height_threshold: 0.03
+max_plane_angle: 20.0
+max_height_above_min: 0.10
+min_candidate_points: 3
+ransac_distance_threshold: 0.03
+ransac_max_iterations: 100
+min_inlier_ratio: 0.50
+
+# Hybrid preprocessor parameters (used internally before ground segmentation)
+preprocess:
+  roi_x_min: -20.0
+  roi_x_max: 0.001
+  roi_y_min: -8.0
+  roi_y_max: 8.0
+  roi_z_min: -2.0
+  roi_z_max: 2.0
+  voxel_leaf: 0.05
+  sor_mean_k: 30
+  sor_stddev: 1.0

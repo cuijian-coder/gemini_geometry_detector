@@ -3,11 +3,19 @@
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
+#include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
 #include <cv_bridge/cv_bridge.h>
-#include <gemini_geometry_detector/ContourInfo.h>
-#include <gemini_geometry_detector/ContourArray.h>
-#include <mutex>
+
+#include "gemini_geometry_detector/ContourInfo.h"
+#include "gemini_geometry_detector/ContourArray.h"
+#include "gemini_geometry_detector/depth_projector.h"
+#include "gemini_geometry_detector/hybrid_ground_segmenter.h"
 
 namespace gemini_geometry_detector
 {
@@ -20,34 +28,33 @@ public:
 
 private:
   void loadParameters();
-  void imageCallback(const sensor_msgs::ImageConstPtr& msg);
-  void timerCallback(const ros::TimerEvent& event);
 
-  // Main processing pipeline
-  void processLatestImage();
+  void rgbDepthInfoCallback(const sensor_msgs::ImageConstPtr& rgb_msg,
+                            const sensor_msgs::ImageConstPtr& depth_msg,
+                            const sensor_msgs::CameraInfoConstPtr& info_msg);
 
-  // Step 1: fetch the latest image safely
-  sensor_msgs::ImageConstPtr getLatestImage();
+  void rgbCloudCallback(const sensor_msgs::ImageConstPtr& rgb_msg,
+                        const sensor_msgs::PointCloud2ConstPtr& cloud_msg);
 
-  // Step 2: convert ROS image to OpenCV
-  cv_bridge::CvImageConstPtr convertToCvImage(const sensor_msgs::ImageConstPtr& image_msg);
+  void processFrame(const sensor_msgs::ImageConstPtr& rgb_msg,
+                    const cv::Mat& bgr_image,
+                    const sensor_msgs::ImageConstPtr& depth_msg,
+                    const sensor_msgs::CameraInfoConstPtr& info_msg);
 
-  // Step 3: create HSV binary mask
+  void processFrameCloud(const sensor_msgs::ImageConstPtr& rgb_msg,
+                         const cv::Mat& bgr_image,
+                         const sensor_msgs::PointCloud2ConstPtr& cloud_msg);
+
   cv::Mat createColorMask(const cv::Mat& bgr_image);
-
-  // Step 4: apply morphological operations
   void applyMorphology(cv::Mat& mask);
-
-  // Step 5: detect external contours
   void detectContours(const cv::Mat& mask, std::vector<std::vector<cv::Point>>& contours);
-
-  // Step 6: build ContourInfo message from OpenCV contour; returns false if filtered out
   bool buildContourInfo(const std::vector<cv::Point>& contour, int id, ContourInfo& info);
-
-  // Step 7: draw a single contour on the annotated image
+  bool buildContourInfo3DFromCloud(const std::vector<cv::Point>& contour,
+                                   int id,
+                                   ContourInfo& info,
+                                   const sensor_msgs::PointCloud2ConstPtr& cloud_msg);
   void drawContourOnImage(cv::Mat& annotated, const std::vector<cv::Point>& contour, const ContourInfo& info);
 
-  // Step 8: publish mask, annotated image and contour array
   void publishResults(const std_msgs::Header& header,
                       const cv::Mat& mask,
                       const cv::Mat& annotated,
@@ -57,29 +64,43 @@ private:
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;
 
-  // Subscribers & Publishers
-  image_transport::Subscriber image_sub_;
+  image_transport::SubscriberFilter rgb_sub_filter_;
+  message_filters::Subscriber<sensor_msgs::Image> depth_sub_;
+  message_filters::Subscriber<sensor_msgs::CameraInfo> info_sub_;
+  using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+      sensor_msgs::Image, sensor_msgs::Image, sensor_msgs::CameraInfo>;
+  std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+
+  message_filters::Subscriber<sensor_msgs::PointCloud2> cloud_sub_;
+  using CloudSyncPolicy = message_filters::sync_policies::ApproximateTime<
+      sensor_msgs::Image, sensor_msgs::PointCloud2>;
+  std::shared_ptr<message_filters::Synchronizer<CloudSyncPolicy>> cloud_sync_;
+
   image_transport::Publisher mask_pub_;
   image_transport::Publisher annotated_pub_;
   ros::Publisher contours_pub_;
-  ros::Timer process_timer_;
+  ros::Publisher ground_cloud_pub_;
+  ros::Publisher depth_cloud_pub_;
 
-  // Parameters
+  DepthProjector depth_projector_;
+  HybridGroundSegmenter ground_segmenter_;
+
   std::string input_topic_;
+  std::string depth_topic_;
+  std::string camera_info_topic_;
+  std::string point_cloud_topic_;
+
+  bool use_point_cloud_;
+
   int h_min_, h_max_;
   int s_min_, s_max_;
   int v_min_, v_max_;
   int morph_kernel_size_;
   int min_contour_area_;
   int max_contour_points_;
-  double process_rate_;
+  double depth_scale_;
 
-  // State
-  sensor_msgs::ImageConstPtr latest_image_;
-  std::mutex image_mutex_;
-  bool has_image_;
-  bool first_image_received_;
-  bool first_image_processed_;
+  bool first_sync_received_;
 };
 
 }  // namespace gemini_geometry_detector

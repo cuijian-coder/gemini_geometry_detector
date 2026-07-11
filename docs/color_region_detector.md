@@ -1,31 +1,38 @@
 # color_region_detector 算法逻辑说明
 
-本文档结合源码，梳理 `color_region_detector` 从 RGB 图像输入到颜色区域轮廓输出的完整算法流程，并对每个关键逻辑节点进行说明。
+本文档结合源码，梳理 `color_region_detector` 从 RGB-D 图像输入到 3D 轮廓输出的完整算法流程，并对每个关键逻辑节点进行说明。
 
 ---
 
 ## 1. 整体流程
 
 ```text
-输入图像 (sensor_msgs/Image)
+输入数据
+    │  ├─ /camera/color/image_raw   (sensor_msgs/Image)
+    │  ├─ /camera/depth/image_raw   (sensor_msgs/Image)
+    │  └─ /camera/color/camera_info (sensor_msgs/CameraInfo)
+    ▼
+[RGB-D Sync] message_filters::ApproximateTime 同步
     │
     ▼
-[ImageSubscriber] cv_bridge 解码为 cv::Mat (BGR)
-    │
-    ▼
-[ColorRegionDetector::processLatestImage]
-    │  ├─ 取最新帧 (getLatestImage)
+[ColorRegionDetector::rgbDepthInfoCallback]
+    │  ├─ cv_bridge 解码 RGB 和 Depth
     │  ├─ BGR → HSV 颜色空间转换
     │  ├─ HSV 阈值分割 → 二值掩码
     │  ├─ 形态学开/闭运算去噪
     │  ├─ findContours 提取外轮廓
-    │  ├─ 面积过滤 + 计算中心/包围盒
+    │  ├─ 面积过滤 + 计算 2D 中心/包围盒
+    │  ├─ DepthProjector::projectContour
+    │  │    ├─ 查中心点深度 Z
+    │  │    ├─ 用 fx/fy/cx/cy 投影到 3D
+    │  │    └─ 计算 mean/min/max depth
     │  └─ 绘制标注图并发布
     ▼
 [输出]
     │  ├─ /gemini_geometry_detector/color/mask
     │  ├─ /gemini_geometry_detector/color/annotated
-    │  └─ /gemini_geometry_detector/color/contours
+    │  ├─ /gemini_geometry_detector/color/contours
+    │  └─ /gemini_geometry_detector/color/contours_3d
     ▼
 输出
 ```
@@ -33,6 +40,7 @@
 ROS 入口：
 - `src/color_region_detector_node.cpp`
 - 主类：`ColorRegionDetector`（`include/gemini_geometry_detector/color_region_detector.h`）
+- 3D 投影类：`DepthProjector`（`include/gemini_geometry_detector/depth_projector.h`）
 
 ---
 
@@ -51,79 +59,68 @@ ROS 入口：
 - `center.y` 表示轮廓中心在图像中的垂直像素坐标。
 - `bbox_tl` / `bbox_br` 分别表示包围盒的左上角和右下角像素坐标。
 
-注意：这是**二维图像坐标系**，后续 Phase 2/3 会结合 `camera_info` 和深度图转换到相机/车体三维坐标系。
+注意：这是**二维图像坐标系**。Phase 2 已经结合 `camera_info` 和深度图把轮廓中心/采样点转换到 `camera_color_optical_frame` 三维坐标系；Phase 3 会进一步转换到 `base_link` / `map`。
 
 ---
 
 ## 3. 输入与消息解码
 
-### 3.1 订阅输入图像
+### 3.1 订阅输入数据
 
 源码：`src/color_region_detector.cpp` → `ColorRegionDetector::ColorRegionDetector()`
 
 ```cpp
-image_sub_ = it_.subscribe(input_topic_, 1, &ColorRegionDetector::imageCallback, this);
+rgb_sub_filter_.subscribe(it_, input_topic_, 1);
+depth_sub_.subscribe(nh_, depth_topic_, 1);
+info_sub_.subscribe(nh_, camera_info_topic_, 1);
+
+sync_.reset(new message_filters::Synchronizer<SyncPolicy>(
+    SyncPolicy(10), rgb_sub_filter_, depth_sub_, info_sub_));
+sync_->registerCallback(
+    boost::bind(&ColorRegionDetector::rgbDepthInfoCallback, this, _1, _2, _3));
 ```
 
-订阅输入彩色图像：
+订阅 RGB-D 同步输入：
 
-- 默认话题：`/camera/color/image_raw`
-- 消息类型：`sensor_msgs/Image`
-- 编码：通常为 `BGR8`
-- 来源：相机驱动或 ROS bag
+| 数据 | 默认话题 | 类型 |
+|---|---|---|
+| RGB | `/camera/color/image_raw` | `sensor_msgs/Image` |
+| Depth | `/camera/depth/image_raw` | `sensor_msgs/Image` |
+| CameraInfo | `/camera/color/camera_info` | `sensor_msgs/CameraInfo` |
 
-### 3.2 最新帧缓冲
+### 3.2 RGB-D 同步回调
 
-源码：`src/color_region_detector.cpp` → `imageCallback()` / `getLatestImage()`
-
-```cpp
-void ColorRegionDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
-{
-  std::lock_guard<std::mutex> lock(image_mutex_);
-  latest_image_ = msg;
-  has_image_ = true;
-}
-```
+源码：`src/color_region_detector.cpp` → `rgbDepthInfoCallback()`
 
 ```cpp
-sensor_msgs::ImageConstPtr ColorRegionDetector::getLatestImage()
+void ColorRegionDetector::rgbDepthInfoCallback(
+    const sensor_msgs::ImageConstPtr& rgb_msg,
+    const sensor_msgs::ImageConstPtr& depth_msg,
+    const sensor_msgs::CameraInfoConstPtr& info_msg)
 {
-  std::lock_guard<std::mutex> lock(image_mutex_);
-  if (!has_image_)
-  {
-    ROS_WARN_THROTTLE(5.0, "No color image received yet on topic: %s", input_topic_.c_str());
-    return sensor_msgs::ImageConstPtr();
-  }
-  return latest_image_;
+  cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
+  cv_depth = cv_bridge::toCvShare(depth_msg);
+  processFrame(rgb_msg, cv_rgb->image, cv_depth->image, info_msg);
 }
 ```
 
 **逻辑说明**：
-- 图像回调只负责把最新帧放入缓冲，不做任何计算。
-- 主处理以固定频率（默认 10Hz）通过 `getLatestImage()` 取走最新帧，避免阻塞高频图像流。
-- 还没有收到图像时，每 5 秒打印一次 WARN 提示。
+- 使用 `message_filters::sync_policies::ApproximateTime` 同步 RGB、Depth、CameraInfo。
+- 同步后统一处理一帧数据，保证 RGB 像素和 Depth 像素对应。
+- 如果 RGB 和 Depth 分辨率不一致，会打印 WARN。
 
 ### 3.3 cv_bridge 解码
 
-源码：`src/color_region_detector.cpp` → `convertToCvImage()`
+源码：`src/color_region_detector.cpp` → `rgbDepthInfoCallback()`
 
 ```cpp
-cv_bridge::CvImageConstPtr ColorRegionDetector::convertToCvImage(const sensor_msgs::ImageConstPtr& image_msg)
-{
-  try
-  {
-    return cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    ROS_ERROR("cv_bridge exception: %s", e.what());
-    return cv_bridge::CvImageConstPtr();
-  }
-}
+cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
+cv_depth = cv_bridge::toCvShare(depth_msg);
 ```
 
 **逻辑说明**：
-- 使用 `cv_bridge::toCvShare` 零拷贝地把 ROS 图像消息转成 `cv::Mat`。
+- RGB 期望编码为 `BGR8`。
+- Depth 支持 `16UC1`（毫米）和 `32FC1`（米），由 `DepthProjector` 自动判断。
 - 期望输入编码为 `BGR8`；如果编码不匹配会抛出异常并打印 ERROR。
 
 ---
@@ -270,32 +267,119 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 
 ### 6.3 主处理流程中的统计
 
-源码：`src/color_region_detector.cpp` → `processLatestImage()`
+源码：`src/color_region_detector.cpp` → `processFrame()`
 
 ```cpp
 int filtered_count = 0;
+int depth_filtered_count = 0;
 for (const auto& contour : contours)
 {
-  ContourInfo info;
-  if (buildContourInfo(contour, id++, info))
+  ContourInfo info_2d;
+  if (!buildContourInfo(contour, id, info_2d))
   {
-    drawContourOnImage(annotated, contour, info);
-    contour_array.contours.push_back(info);
+    ++filtered_count;
+    continue;
+  }
+
+  drawContourOnImage(annotated, contour, info_2d);
+  contour_array.contours.push_back(info_2d);
+
+  Contour3DInfo info_3d;
+  info_3d.id = info_2d.id;
+  // ... copy 2D fields
+  if (depth_projector_.projectContour(contour, depth_image, info_3d,
+                                      sample_3d_step_, publish_points_3d_))
+  {
+    contour_3d_array.contours.push_back(info_3d);
   }
   else
   {
-    ++filtered_count;
+    ++depth_filtered_count;
   }
 }
-
-ROS_DEBUG("Image %dx%d, raw contours: %zu, valid: %zu, filtered by area: %d",
-          cv_ptr->image.cols, cv_ptr->image.rows,
-          contours.size(), contour_array.contours.size(), filtered_count);
 ```
 
 **逻辑说明**：
 - 遍历所有外轮廓，过滤掉小面积轮廓。
-- 每帧打印 DEBUG 日志，包含图像尺寸、原始轮廓数、有效轮廓数、被面积过滤掉的轮廓数。
+- 对每个有效 2D 轮廓调用 `DepthProjector` 投影到 3D。
+- 深度无效（超出范围或中心点无深度）的轮廓被过滤。
+
+### 6.4 3D 投影（DepthProjector）
+
+源码：`src/depth_projector.cpp` → `DepthProjector::projectContour()` / `projectPixel()`
+
+#### 6.4.1 相机内参设置
+
+```cpp
+void DepthProjector::setCameraInfo(const sensor_msgs::CameraInfoConstPtr& camera_info)
+{
+  fx_ = camera_info->K[0];
+  fy_ = camera_info->K[4];
+  cx_ = camera_info->K[2];
+  cy_ = camera_info->K[5];
+}
+```
+
+#### 6.4.2 深度值转换
+
+```cpp
+bool DepthProjector::convertDepthValue(const cv::Mat& depth_image, int u, int v, float& depth_m) const
+{
+  if (depth_image.type() == CV_16UC1)
+  {
+    uint16_t raw = depth_image.at<uint16_t>(v, u);
+    depth_m = static_cast<float>(raw) * depth_scale_;
+  }
+  else if (depth_image.type() == CV_32FC1)
+  {
+    depth_m = depth_image.at<float>(v, u);
+  }
+  return isDepthValid(depth_m);
+}
+```
+
+#### 6.4.3 单像素投影
+
+```cpp
+bool DepthProjector::projectPixel(int u, int v, const cv::Mat& depth_image,
+                                  float& X, float& Y, float& Z) const
+{
+  if (!convertDepthValue(depth_image, u, v, Z)) return false;
+  X = (u - cx_) * Z / fx_;
+  Y = (v - cy_) * Z / fy_;
+  return true;
+}
+```
+
+#### 6.4.4 轮廓投影
+
+```cpp
+bool DepthProjector::projectContour(const std::vector<cv::Point>& contour_2d,
+                                    const cv::Mat& depth_image,
+                                    Contour3DInfo& info,
+                                    int sample_step,
+                                    bool publish_points_3d) const
+{
+  // 1. 投影中心点
+  // 2. 采样轮廓点并投影
+  // 3. 计算 mean/min/max depth
+}
+```
+
+**逻辑说明**：
+- 先用图像矩计算 2D 中心 `(u, v)`，查询深度后投影到 3D。
+- 按 `sample_step` 采样轮廓点，逐一投影。
+- 过滤掉深度不在 `[min_depth_m, max_depth_m]` 范围内的轮廓。
+
+#### 6.4.5 投影公式
+
+```text
+X = (u - cx) * Z / fx
+Y = (v - cy) * Z / fy
+Z = depth(u, v)
+```
+
+坐标系为 `camera_color_optical_frame`，单位：米。
 
 ---
 
@@ -330,7 +414,8 @@ void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
 void ColorRegionDetector::publishResults(const std_msgs::Header& header,
                                          const cv::Mat& mask,
                                          const cv::Mat& annotated,
-                                         const ContourArray& contour_array)
+                                         const ContourArray& contour_array,
+                                         const Contour3DArray& contour_3d_array)
 {
   // mask
   cv_bridge::CvImage mask_msg;
@@ -346,14 +431,17 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
   annotated_msg.image = annotated;
   annotated_pub_.publish(annotated_msg.toImageMsg());
 
-  // contours
+  // 2D contours
   contours_pub_.publish(contour_array);
+
+  // 3D contours
+  contours_3d_pub_.publish(contour_3d_array);
 }
 ```
 
 **逻辑说明**：
 - 掩码和标注图像使用 `cv_bridge` 重新编码为 ROS 图像消息。
-- 所有输出消息共享同一 `header`，保证时间戳和 `frame_id` 与输入图像一致。
+- 2D 和 3D 轮廓消息共享同一 `header`，保证时间戳和 `frame_id` 与输入 RGB 图像一致。
 
 ---
 
@@ -363,23 +451,30 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 |---|---|---|
 | `/gemini_geometry_detector/color/mask` | `sensor_msgs/Image` | 二值掩码（MONO8） |
 | `/gemini_geometry_detector/color/annotated` | `sensor_msgs/Image` | 带轮廓/中心/包围盒的标注图（BGR8） |
-| `/gemini_geometry_detector/color/contours` | `gemini_geometry_detector/ContourArray` | 检测到的轮廓数组 |
+| `/gemini_geometry_detector/color/contours` | `gemini_geometry_detector/ContourArray` | 2D 轮廓数组 |
+| `/gemini_geometry_detector/color/contours_3d` | `gemini_geometry_detector/Contour3DArray` | 3D 轮廓数组 |
 
 ---
 
 ## 9. 参数说明
 
-参数文件：`config/color_thresholds.yaml`
+参数文件：`config/detector.yaml`
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `h_min` / `h_max` | 20 / 40 | HSV 色调范围（OpenCV 中 H 为 0~179） |
+| `input_topic` | `/camera/color/image_raw` | RGB 输入话题 |
+| `depth_topic` | `/camera/depth/image_raw` | 深度输入话题 |
+| `camera_info_topic` | `/camera/color/camera_info` | 相机内参话题 |
+| `h_min` / `h_max` | 20 / 40 | HSV 色调范围 |
 | `s_min` / `s_max` | 80 / 255 | HSV 饱和度范围 |
 | `v_min` / `v_max` | 80 / 255 | HSV 亮度范围 |
-| `morph_kernel_size` | 5 | 形态学核大小，0 表示关闭，正奇数 |
+| `morph_kernel_size` | 5 | 形态学核大小，0 表示关闭 |
 | `min_contour_area` | 200 | 轮廓最小面积阈值（像素²） |
-| `max_contour_points` | 64 | 每个轮廓最多发布的点数，0 表示全部 |
-| `process_rate` | 10.0 | 处理频率（Hz） |
+| `max_contour_points` | 64 | 2D 轮廓最大点数 |
+| `sample_3d_step` | 5 | 3D 投影采样步长 |
+| `publish_points_3d` | `true` | 是否发布 3D 轮廓点 |
+| `depth_scale` | 0.001 | 16UC1 深度转米比例 |
+| `min_depth_m` / `max_depth_m` | 0.1 / 10.0 | 有效深度范围 |
 
 ---
 
@@ -404,10 +499,7 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 - 误检太多小区域 → 增大 `min_contour_area`。
 - 目标远处变小导致漏检 → 减小 `min_contour_area`。
 
-### 10.4 处理频率
 
-- 默认 10Hz 已经能满足大部分场景。
-- 如果需要更低延迟，可提高 `process_rate`，但会占用更多 CPU。
 
 ---
 
@@ -417,28 +509,29 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 |---|---|
 | `src/color_region_detector_node.cpp` | ROS 节点入口 |
 | `include/gemini_geometry_detector/color_region_detector.h` | `ColorRegionDetector` 类声明 |
-| `src/color_region_detector.cpp` | 核心算法实现 |
-| `config/color_thresholds.yaml` | HSV 与形态学参数配置 |
+| `src/color_region_detector.cpp` | RGB-D 同步、颜色分割、轮廓检测、发布 |
+| `include/gemini_geometry_detector/depth_projector.h` | `DepthProjector` 类声明 |
+| `src/depth_projector.cpp` | 深度解析、2D→3D 投影 |
+| `config/detector.yaml` | HSV / 形态学 / 深度 / 3D 参数配置 |
 | `launch/color_detector.launch` | 单独启动检测节点 |
 | `launch/color_detector_rviz.launch` | 启动检测节点 + RViz |
 | `rviz/color_detector.rviz` | RViz 配置文件 |
-| `msg/ContourInfo.msg` | 单个轮廓消息定义 |
-| `msg/ContourArray.msg` | 轮廓数组消息定义 |
+| `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
+| `msg/Contour3DInfo.msg` / `Contour3DArray.msg` | 3D 轮廓消息 |
 
 ---
 
 ## 12. 后续扩展提示
 
-Phase 2 可在当前节点基础上增加：
-- 订阅 `/camera/depth/image_raw` 和 `/camera/color/camera_info`。
-- 用 `message_filters` 同步 RGB 与 Depth。
-- 对检测到的轮廓中心 `(u, v)`，查询对应深度 `Z`。
-- 用相机内参 `fx, fy, cx, cy` 将像素坐标转换到相机三维坐标：
+Phase 3 可进一步：
+- 订阅 `/tf`，把 `camera_color_optical_frame` 下的 3D 轮廓转换到 `base_link` / `map`。
+- 对 3D 轮廓点做 PCA/RANSAC 拟合 3D 直线或 2D 地面线。
+- 与地图线匹配，计算车体到目标线的横向距离。
+
+核心公式已经具备：
 
 ```text
 X = (u - cx) * Z / fx
 Y = (v - cy) * Z / fy
 Z = depth(u, v)
 ```
-
-Phase 3 可进一步把结果转换到 `base_link` / `map` 坐标系，并计算到地图线的距离。
