@@ -1,11 +1,15 @@
 # gemini_geometry_detector
 
-RGB-D 颜色区域检测与 3D 轮廓提取模块。
+RGB-D 颜色区域检测与地面点云提取模块。
 
 本包采用分阶段开发策略：
 - **Phase 1**：基于 RGB 做颜色区域检测与轮廓提取（已完成）
-- **Phase 2**：加入深度图和相机内参，把 2D 轮廓投影到相机坐标系 3D 点（已完成）
+- **Phase 2**：订阅 OrbbecSDK_ROS1 发布的对齐点云，进行地面分割（已完成）
 - **Phase 3**（后续）：坐标系转换、地图匹配、到线距离计算
+
+> **注意**：地面平面 A/B/C/D 的计算已迁移到独立的 `ground_plane_calibrator` 包。
+> `gemini_geometry_detector` 现在通过订阅 `/ground_plane_calibrator/ground_plane/coefficients`
+> 获取外部标定好的平面系数，不再每帧自行拟合。
 
 ---
 
@@ -14,54 +18,62 @@ RGB-D 颜色区域检测与 3D 轮廓提取模块。
 ```text
 RGB-D 相机 / ROS bag
         |
-        | /camera/color/image_raw       (sensor_msgs/Image)
-        | /camera/depth/image_raw       (sensor_msgs/Image)
-        | /camera/color/camera_info     (sensor_msgs/CameraInfo)
+        | /camera/depth_registered/points      (sensor_msgs/PointCloud2)
         v
-+---------------------------+
-|  RGB-D Sync (ApproximateTime)  |  同步 RGB + Depth + CameraInfo
++-----------------------------+
+|  ground_plane_calibrator    |
+|  自动采集 5~10s              |
+|  计算地面平面 A/B/C/D        |
+|  发布 /ground_plane/...     |
++-----------------------------+
+        |
+        | /ground_plane_calibrator/ground_plane/coefficients
+        | (ground_plane_calibrator/PlaneCoefficients)
+        v
++-----------------------------+
+|  RGB-Cloud Sync             |  同步 RGB + PointCloud2
 |  src/color_region_detector.cpp
-+---------------------------+
++-----------------------------+
         |
         v
-+---------------------------+
-|   ColorRegionDetector     |
++-----------------------------+
+|   ColorRegionDetector       |
 | src/color_region_detector.cpp
-|  ├─ BGR → HSV → inRange   |  颜色分割
-|  ├─ morphologyEx          |  形态学
-|  ├─ findContours          |  轮廓检测
-|  ├─ buildContourInfo      |  2D 轮廓信息
-|  └─ DepthProjector        |  2D → 3D 投影
-|     src/depth_projector.cpp
-+---------------------------+
+|  ├─ BGR → HSV → inRange     |  颜色分割
+|  ├─ morphologyEx            |  形态学
+|  ├─ findContours            |  轮廓检测
+|  ├─ buildContourInfo        |  2D 轮廓信息
+|  └─ 外部 A/B/C/D 引导 3D     |  使用订阅的平面系数反投影轮廓
++-----------------------------+
         |
-        | mask + annotated + ContourArray + Contour3DArray
+        | mask + annotated + ContourArray + depth_cloud
         v
-+---------------------------+
-|         输出               |
-+---------------------------+
++-----------------------------+
+|           输出               |
++-----------------------------+
         |
         v
    /gemini_geometry_detector/color/mask
    /gemini_geometry_detector/color/annotated
    /gemini_geometry_detector/color/contours
-   /gemini_geometry_detector/color/contours_3d
+   /gemini_geometry_detector/color/depth_cloud
 ```
 
 ### 1.1 输入阶段
 
-源码：`src/color_region_detector.cpp` → `rgbDepthInfoCallback()`
+源码：`src/color_region_detector.cpp` → `rgbCloudCallback()`
 
 输入：
 - `/camera/color/image_raw`：`sensor_msgs/Image`，BGR8 编码
-- `/camera/depth/image_raw`：`sensor_msgs/Image`，16UC1（毫米）或 32FC1（米）
-- `/camera/color/camera_info`：`sensor_msgs/CameraInfo`，提供 `fx, fy, cx, cy`
+- `/camera/depth_registered/points`：`sensor_msgs/PointCloud2`，已对齐到彩色图（`xyz` 或 `xyzrgb`）
+- `/ground_plane_calibrator/ground_plane/coefficients`：
+  `ground_plane_calibrator/PlaneCoefficients`，由 `ground_plane_calibrator` 发布的地面平面系数 A/B/C/D
 
 处理流程：
 
-1. **RGB-D 同步**：使用 `message_filters::ApproximateTime` 同步三者的回调。
+1. **RGB-Cloud 同步**：使用 `message_filters::ApproximateTime` 同步彩色图与点云。
 2. **cv_bridge 解码**：把 ROS 图像消息转成 `cv::Mat`。
-3. **分辨率检查**：如果 RGB 和 Depth 分辨率不一致，打印 WARN。
+3. **点云中心反查**：对检测到的 2D 轮廓中心 `(u, v)`，在有序点云中取 `index = v * width + u`，得到对应 3D 坐标并过滤无效轮廓。
 
 ### 1.2 颜色分割阶段
 
@@ -95,24 +107,16 @@ v_max: 255
 4. **几何计算**：通过图像矩计算轮廓中心，通过 `boundingRect` 计算包围盒。
 5. **下采样**：每个 2D 轮廓最多保留 `max_contour_points` 个点。
 
-### 1.4 3D 投影阶段
+### 1.4 3D 引导线阶段
 
-源码：`src/depth_projector.cpp` → `DepthProjector::projectContour()`
+源码：`src/color_region_detector.cpp` → `processFrame()`
 
 处理流程：
 
-1. 从 `CameraInfo.K` 提取相机内参 `fx, fy, cx, cy`。
-2. 对 2D 轮廓中心 `(u, v)` 查询深度 `Z`。
-3. 用公式计算相机坐标系下的 3D 坐标：
-
-```text
-X = (u - cx) * Z / fx
-Y = (v - cy) * Z / fy
-Z = depth(u, v)
-```
-
-4. 对轮廓采样点做同样的投影，计算 `mean_depth` / `min_depth` / `max_depth`。
-5. 过滤深度不在 `[min_depth_m, max_depth_m]` 范围内的轮廓。
+1. 接收外部标定节点发布的地面平面系数 A/B/C/D。
+2. 对最大 2D 轮廓做矩形近似。
+3. 利用相机内参将 2D 像素反投影为射线，与外部平面求交，得到 3D 引导线。
+4. 转发原始深度点云到 `/color/depth_cloud`。
 
 ### 1.5 输出阶段
 
@@ -123,9 +127,10 @@ Z = depth(u, v)
 - `/gemini_geometry_detector/color/mask`：二值掩码（MONO8）
 - `/gemini_geometry_detector/color/annotated`：带轮廓/中心/包围盒的标注图（BGR8）
 - `/gemini_geometry_detector/color/contours`：2D 轮廓数组（`ContourArray.msg`）
-- `/gemini_geometry_detector/color/contours_3d`：3D 轮廓数组（`Contour3DArray.msg`，新增）
-- `/gemini_geometry_detector/color/ground_cloud`：地面点云（`sensor_msgs/PointCloud2`）
 - `/gemini_geometry_detector/color/depth_cloud`：完整深度 3D 点云（`sensor_msgs/PointCloud2`）
+- `/gemini_geometry_detector/color/guide_line_cloud`：地面 3D 引导线点云（`sensor_msgs/PointCloud2`）
+- `/gemini_geometry_detector/color/guide_line_marker`：地面 3D 引导线 RViz Marker（`visualization_msgs/Marker`，`LINE_STRIP`）
+- `/gemini_geometry_detector/color/contours_3d`：最大轮廓的 3D 信息（`Contour3DArray.msg`）
 
 ---
 
@@ -136,14 +141,16 @@ Z = depth(u, v)
 | 话题 | 类型 | 作用 |
 |------|------|------|
 | `/camera/color/image_raw` | `sensor_msgs/Image` | 输入彩色图像 |
-| `/camera/depth/image_raw` | `sensor_msgs/Image` | 输入深度图像 |
+| `/camera/depth_registered/points` | `sensor_msgs/PointCloud2` | Orbbec 输入对齐点云 |
 | `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | 彩色相机内参 |
+| `/ground_plane_calibrator/ground_plane/coefficients` | `ground_plane_calibrator/PlaneCoefficients` | 外部地面平面 A/B/C/D |
 | `/gemini_geometry_detector/color/mask` | `sensor_msgs/Image` | 二值掩码 |
 | `/gemini_geometry_detector/color/annotated` | `sensor_msgs/Image` | 可视化标注图 |
 | `/gemini_geometry_detector/color/contours` | `gemini_geometry_detector/ContourArray` | 2D 轮廓 |
-| `/gemini_geometry_detector/color/contours_3d` | `gemini_geometry_detector/Contour3DArray` | 3D 轮廓 |
-| `/gemini_geometry_detector/color/ground_cloud` | `sensor_msgs/PointCloud2` | 地面点云 |
 | `/gemini_geometry_detector/color/depth_cloud` | `sensor_msgs/PointCloud2` | 完整深度 3D 点云 |
+| `/gemini_geometry_detector/color/guide_line_cloud` | `sensor_msgs/PointCloud2` | 地面 3D 引导线点云 |
+| `/gemini_geometry_detector/color/guide_line_marker` | `visualization_msgs/Marker` | 地面 3D 引导线可视化 |
+| `/gemini_geometry_detector/color/contours_3d` | `gemini_geometry_detector/Contour3DArray` | 最大轮廓 3D 信息 |
 
 自定义消息：
 
@@ -151,33 +158,24 @@ Z = depth(u, v)
 - `gemini_geometry_detector/ContourArray.msg`
 - `gemini_geometry_detector/Contour3DInfo.msg`
 - `gemini_geometry_detector/Contour3DArray.msg`
-
-`Contour3DInfo` 字段：
-
-| 字段 | 说明 |
-|------|------|
-| `id` | 轮廓编号 |
-| `center_2d` | 轮廓中心像素坐标 `(u, v, 0)` |
-| `center_3d` | 轮廓中心相机坐标 `(X, Y, Z)`，单位：米 |
-| `area` | 轮廓面积（像素²） |
-| `bbox_tl` / `bbox_br` | 2D 包围盒 |
-| `points_2d` | 下采样 2D 轮廓点 |
-| `points_3d` | 对应 3D 轮廓点（可选） |
-| `mean_depth` / `min_depth` / `max_depth` | 采样点深度统计，单位：米 |
+- `ground_plane_calibrator/PlaneCoefficients.msg`（外部包）
 
 ### 2.2 核心类
 
 | 类 | 文件 | 职责 |
 |---|---|---|
-| `ColorRegionDetector` | `src/color_region_detector.cpp` | RGB-D 同步、颜色分割、轮廓检测、结果发布 |
-| `DepthProjector` | `src/depth_projector.cpp` | 深度图解析、相机模型、2D→3D 投影 |
+| `ColorRegionDetector` | `src/color_region_detector.cpp` | RGB-Cloud 同步、颜色分割、轮廓检测、结果发布 |
+| `GuideLineEstimator` | `src/guide_line_estimator.cpp` | 2D 轮廓像素反投影、射线与地面求交、生成引导线消息 |
+| `GroundPlaneCalibrator` | `../ground_plane_calibrator/src/ground_plane_calibrator.cpp` | 累积点云、地面分割、拟合地面平面、发布 A/B/C/D |
+| `HybridGroundSegmenter` | `../ground_plane_calibrator/src/hybrid_ground_segmenter.cpp` | 地面点云分割 |
+| `HybirdPreprocessor` | `../ground_plane_calibrator/src/hybird_preprocessor.cpp` | 地面分割前预处理 |
 
 ### 2.3 关键库接口
 
-- `message_filters::Synchronizer` + `ApproximateTime`：RGB-D 时间同步
+- `message_filters::Synchronizer` + `ApproximateTime`：RGB-Cloud 时间同步
 - `cv_bridge::toCvShare`：ROS 图像 ↔ OpenCV
 - `cv::inRange` / `cv::morphologyEx` / `cv::findContours`：图像处理
-- `sensor_msgs::CameraInfo::K`：相机内参
+- `pcl::fromROSMsg` / `pcl::toROSMsg`：ROS 点云 ↔ PCL
 
 ---
 
@@ -185,15 +183,12 @@ Z = depth(u, v)
 
 ### 3.1 支持的传感器
 
-本模块对具体硬件依赖很小，只要是发布标准 ROS 消息的 RGB-D 相机或 RGB 相机都可以接入。
+本模块依赖 OrbbecSDK_ROS1 发布的对齐点云，因此适用于 Orbbec 系列 RGB-D 相机。
 
 | 输入 | 话题示例 | 说明 |
 |---|---|---|
 | RGB 图像 | `/camera/color/image_raw` | `sensor_msgs/Image`，BGR8 |
-| 深度图像 | `/camera/depth/image_raw` | `sensor_msgs/Image`，16UC1 或 32FC1 |
-| 相机内参 | `/camera/color/camera_info` | `sensor_msgs/CameraInfo` |
-
-> 如果只有 RGB 没有 Depth，节点会因为没有同步数据而无法处理。Phase 1 的纯 RGB 版本可通过切换配置文件恢复。
+| 对齐点云 | `/camera/depth_registered/points` | `sensor_msgs/PointCloud2` |
 
 ### 3.2 所需主机
 
@@ -211,16 +206,18 @@ Z = depth(u, v)
 - `sensor_msgs`、`std_msgs`、`geometry_msgs`
 - `cv_bridge`、`image_transport`、`message_filters`
 - `message_generation`、`message_runtime`
+- `pcl_conversions`
 
 系统依赖：
 
 - OpenCV 3.2+（ROS Melodic 自带）
-- Eigen3（后续 Phase 使用）
+- PCL（ROS Melodic 自带）
+- Eigen3
 
 ### 3.4 运行前提
 
-- 输入彩色图像、深度图像、相机内参话题都已发布。
-- 深度图已与彩色图对齐（D2C），或至少分辨率一致。
+- Orbbec 驱动已开启点云输出：`enable_point_cloud:=true`、`depth_registration:=true`、`ordered_pc:=true`。
+- 点云和彩色图分辨率一致，且帧ID为彩色光心坐标系。
 
 ---
 
@@ -229,34 +226,30 @@ Z = depth(u, v)
 | 参数 | 所在文件 | 作用 |
 |------|---------|------|
 | `input_topic` | `config/detector.yaml` | 输入彩色图像话题 |
-| `depth_topic` | `config/detector.yaml` | 输入深度图像话题 |
-| `camera_info_topic` | `config/detector.yaml` | 相机内参话题 |
 | `point_cloud_topic` | `config/detector.yaml` | Orbbec 输入点云话题 |
-| `use_point_cloud` | `config/detector.yaml` | 是否使用 Orbbec 点云代替深度图 |
+| `camera_info_topic` | `config/detector.yaml` | 彩色相机内参话题 |
+| `plane_coefficients_topic` | `config/detector.yaml` | 外部地面平面 A/B/C/D 话题 |
 | `h_min` / `h_max` | `config/detector.yaml` | HSV 色调范围 |
 | `s_min` / `s_max` | `config/detector.yaml` | HSV 饱和度范围 |
 | `v_min` / `v_max` | `config/detector.yaml` | HSV 亮度范围 |
 | `morph_kernel_size` | `config/detector.yaml` | 形态学核大小 |
-| `min_contour_area` | `config/detector.yaml` | 轮廓最小面积阈值 |
+| `min_contour_area` | `config/detector.yaml` | 轮廓最小面积阈值（原图分辨率） |
 | `max_contour_points` | `config/detector.yaml` | 2D 轮廓最大点数 |
-| `sample_3d_step` | `config/detector.yaml` | 3D 投影采样步长 |
-| `publish_points_3d` | `config/detector.yaml` | 是否发布 3D 轮廓点 |
-| `depth_scale` | `config/detector.yaml` | 深度 raw value 转米（16UC1 用 0.001） |
-| `min_depth_m` / `max_depth_m` | `config/detector.yaml` | 有效深度范围 |
+| `image_scale` | `config/detector.yaml` | 颜色检测和引导线的图像缩放比例 |
+| `guide_line_every_n` | `config/detector.yaml` | 每隔 N 帧计算一次 3D 引导线 |
 
 ---
 
 ## 5. 面向开发者的重要约定
 
 - **按职责分层**：
-  - `ColorRegionDetector`：ROS 接口 + 2D 检测流程
-  - `DepthProjector`：纯几何投影，不依赖 ROS
-- **算法与 ROS 解耦**：
-  - `DepthProjector` 只接收 `cv::Mat` 和 `CameraInfo`，便于单元测试。
+  - `ColorRegionDetector`：ROS 接口 + 2D 检测流程 + 点云转发
+  - `GroundPlaneCalibrator`：ROS 接口 + 地面分割 + 平面拟合 + A/B/C/D 发布
+  - `HybridGroundSegmenter`：纯 PCL 地面分割，不依赖 ROS
 - **消息转换集中**：
   - 所有 ROS 消息构造在 `publishResults()` 中完成。
 - **每帧 INFO 日志**：
-  - 输出 2D/3D 轮廓数量、过滤数量，便于调参。
+  - 输出 2D 轮廓数量、过滤数量，便于调参。
 
 ---
 
@@ -270,49 +263,42 @@ source /opt/ros/melodic/setup.bash
 catkin_make
 ```
 
-### 6.2 启动检测节点
+### 6.2 启动 Orbbec 相机
 
-确保输入话题已经发布，然后：
+确保驱动开启对齐点云：
+
+```bash
+roslaunch orbbec_camera gemini_330_series.launch \
+  enable_point_cloud:=true \
+  depth_registration:=true \
+  ordered_pc:=true \
+  publish_tf:=true
+```
+
+### 6.3 启动地面平面标定节点
+
+`gemini_geometry_detector` 现在依赖外部 A/B/C/D，必须先启动标定节点：
+
+```bash
+source /home/jiancui1804/orbbec_ws/devel/setup.bash
+roslaunch ground_plane_calibrator calibrator.launch
+```
+
+### 6.4 启动检测节点
 
 ```bash
 source /home/jiancui1804/orbbec_ws/devel/setup.bash
 roslaunch gemini_geometry_detector color_detector.launch
 ```
 
-### 6.3 启动检测节点 + RViz
+### 6.5 启动检测节点 + RViz
 
 ```bash
 source /home/jiancui1804/orbbec_ws/devel/setup.bash
 roslaunch gemini_geometry_detector color_detector_rviz.launch
 ```
 
-### 6.4 使用 OrbbecSDK_ROS1 点云输入
-
-在启动 Orbbec 驱动时开启 `enable_point_cloud`、`depth_registration`、`ordered_pc`，然后：
-
-```bash
-source /home/jiancui1804/orbbec_ws/devel/setup.bash
-roslaunch gemini_geometry_detector color_detector_rviz.launch use_point_cloud:=true
-```
-
-### 6.5 同时对比 DepthProjector 与 Orbbec 点云
-
-启动两个检测节点实例，一个走 `DepthProjector`（深度图模式），一个走 Orbbec 点云，RViz 里同时显示两份完整点云和地面点云：
-
-```bash
-source /home/jiancui1804/orbbec_ws/devel/setup.bash
-roslaunch gemini_geometry_detector compare_point_clouds.launch
-```
-
-RViz 中：
-- **白色**：`DepthProjector` 生成的完整点云
-- **红色**：OrbbecSDK_ROS1 发布的完整点云
-- **绿色**：`DepthProjector` 模式分割出的地面点云
-- **黄色**：Orbbec 点云模式分割出的地面点云
-
-> 固定帧为 `camera_link`，需要相机驱动发布对应的 TF。
-
-### 6.6 配合 bag 使用
+### 6.5 配合 bag 使用
 
 ```bash
 # 终端 1：启动检测 + RViz
@@ -322,11 +308,11 @@ roslaunch gemini_geometry_detector color_detector_rviz.launch
 rosbag play your_bag.bag -l
 ```
 
-### 6.7 查看输出
+### 6.6 查看输出
 
 ```bash
-# 查看 3D 轮廓数值
-rostopic echo /gemini_geometry_detector/color/contours_3d
+# 查看 2D 轮廓
+rostopic echo /gemini_geometry_detector/color/contours
 
 # 查看标注图
 rqt_image_view /gemini_geometry_detector/color/annotated
@@ -338,10 +324,14 @@ rqt_image_view /gemini_geometry_detector/color/annotated
 
 `color_detector_rviz.launch` 会自动打开 RViz，显示：
 
-1. **Annotated**：带绿色轮廓、红色中心点、蓝色包围盒的标注图
-2. **Mask**：HSV 阈值分割后的二值掩码
+1. **Grid**：地面网格。
+2. **Annotated**：带绿色轮廓、红色中心点、蓝色包围盒的标注图。
+3. **Mask**：HSV 阈值分割后的二值掩码。
+4. **GuideLineMarker**：红色地面 3D 引导线（`LINE_STRIP`）。
+5. **GuideLineCloud**：红色地面 3D 引导线点云。
+6. **GroundPlaneMarker**（来自 `ground_plane_calibrator`）：绿色地面平面法向箭头。
 
-`Contour3DArray` 目前通过 `rostopic echo` 查看数值，Phase 3 会加入 Marker 可视化。
+固定帧为 `camera_color_optical_frame`。
 
 ---
 
@@ -359,15 +349,10 @@ rqt_image_view /gemini_geometry_detector/color/annotated
 - 误检小区域 → 增大 `min_contour_area`
 - 远处目标漏检 → 减小 `min_contour_area`
 
-### 8.3 深度过滤
+### 8.3 点云相关
 
-- 太近/太远的轮廓被过滤 → 调整 `min_depth_m` / `max_depth_m`
-- 深度抖动大 → 增大 `sample_3d_step` 或关闭 `publish_points_3d`
-
-### 8.4 3D 投影
-
-- 如果深度编码是 `32FC1`（米），把 `depth_scale` 改为 `1.0`。
-- 如果深度未与彩色对齐，需先确保驱动端 D2C 开启。
+- 2D 轮廓中心在点云中查不到有效点 → 检查 Orbbec 驱动是否开启 `ordered_pc:=true`。
+- 点云和彩色图分辨率不一致 → 检查驱动端 D2C / 深度配准是否开启。
 
 ---
 
@@ -385,13 +370,14 @@ rqt_image_view /gemini_geometry_detector/color/annotated
 |---|---|
 | `src/color_region_detector_node.cpp` | ROS 节点入口 |
 | `include/gemini_geometry_detector/color_region_detector.h` | `ColorRegionDetector` 类声明 |
-| `src/color_region_detector.cpp` | RGB-D 同步、颜色分割、轮廓检测、发布 |
-| `include/gemini_geometry_detector/depth_projector.h` | `DepthProjector` 类声明 |
-| `src/depth_projector.cpp` | 深度解析、2D→3D 投影 |
-| `config/detector.yaml` | HSV / 形态学 / 深度 / 3D 参数配置 |
+| `src/color_region_detector.cpp` | RGB-Cloud 同步、颜色分割、轮廓检测、发布 |
+| `include/gemini_geometry_detector/guide_line_estimator.h` | `GuideLineEstimator` 类声明 |
+| `src/guide_line_estimator.cpp` | 2D 像素反投影、射线-地面求交、消息生成 |
+| `config/detector.yaml` | HSV / 形态学参数配置 |
 | `launch/color_detector.launch` | 启动检测节点 |
 | `launch/color_detector_rviz.launch` | 启动检测节点 + RViz |
+| `../ground_plane_calibrator/launch/calibrator.launch` | 启动地面平面标定节点 |
 | `rviz/color_detector.rviz` | RViz 配置文件 |
 | `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
 | `msg/Contour3DInfo.msg` / `Contour3DArray.msg` | 3D 轮廓消息 |
-| `docs/color_region_detector.md` | 详细算法说明文档 |
+| `docs/color_region_detector.md` | 历史详细算法说明文档（已过期） |

@@ -1,3 +1,5 @@
+> ⚠️ **本文档已过期**：当前 `color_region_detector` 已不再使用 `DepthProjector`，改为直接订阅 OrbbecSDK_ROS1 发布的对齐点云 `/camera/depth_registered/points`。具体用法请参考根目录 `README.md`。
+
 # color_region_detector 算法逻辑说明
 
 本文档结合源码，梳理 `color_region_detector` 从 RGB-D 图像输入到 3D 轮廓输出的完整算法流程，并对每个关键逻辑节点进行说明。

@@ -20,14 +20,14 @@ min_contour_area: 200
 # Maximum number of contour points to publish per contour (0 = all, downsample if >0)
 max_contour_points: 64
 
+# Image scale for color detection and guide-line estimation (0.5 = 640x400 for 1280x800 input)
+image_scale: 0.5
+
+# Compute the 3D guide line only every N frames (1 = every frame)
+guide_line_every_n: 1
+
 # Input topics
 input_topic: /camera/color/image_raw
-depth_topic: /camera/depth/image_raw
-camera_info_topic: /camera/color/camera_info
 point_cloud_topic: /camera/depth_registered/points
-
-# Depth scale. For 16UC1 (mm) use 0.001; for 32FC1 (meters) use 1.0
-depth_scale: 0.001
-
-# Use OrbbecSDK_ROS1 point cloud instead of depth image + camera_info
-use_point_cloud: false
+camera_info_topic: /camera/color/camera_info
+plane_coefficients_topic: /ground_plane_calibrator/ground_plane/coefficients

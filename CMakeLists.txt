@@ -14,6 +14,8 @@ find_package(catkin REQUIRED COMPONENTS
   message_filters
   message_generation
   pcl_conversions
+  visualization_msgs
+  ground_plane_calibrator
 )
 
 find_package(OpenCV REQUIRED)
@@ -46,6 +48,8 @@ catkin_package(
     message_filters
     message_runtime
     pcl_conversions
+    visualization_msgs
+    ground_plane_calibrator
   DEPENDS OpenCV
 )
 
@@ -60,14 +64,13 @@ include_directories(
 add_executable(color_region_detector_node
   src/color_region_detector_node.cpp
   src/color_region_detector.cpp
-  src/depth_projector.cpp
-  src/hybird_preprocessor.cpp
-  src/hybrid_ground_segmenter.cpp
+  src/guide_line_estimator.cpp
 )
 
 add_dependencies(color_region_detector_node
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
+  ground_plane_calibrator_generate_messages_cpp
 )
 
 target_link_libraries(color_region_detector_node
