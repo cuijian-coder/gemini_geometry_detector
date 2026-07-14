@@ -1,26 +1,25 @@
 <launch>
   <!--
     Launch color region detector together with RViz.
-    Use this when the camera driver (or bag) is already publishing the required topics.
+    Use this when the camera driver (or bag) is already publishing RGB and CameraInfo.
   -->
 
   <arg name="input_topic" default="/camera/color/image_raw"/>
-  <arg name="point_cloud_topic" default="/camera/depth_registered/points"/>
   <arg name="camera_info_topic" default="/camera/color/camera_info"/>
-  <arg name="plane_coefficients_topic"
-       default="/ground_plane_calibrator/ground_plane/coefficients"/>
   <arg name="config_file"
        default="$(find gemini_geometry_detector)/config/detector.yaml"/>
   <arg name="rviz_config"
        default="$(find gemini_geometry_detector)/rviz/color_detector.rviz"/>
+  <arg name="ground_plane_provider_type" default=""/>
+  <arg name="camera_height" default=""/>
 
   <!-- Color region detector -->
   <include file="$(find gemini_geometry_detector)/launch/color_detector.launch">
     <arg name="input_topic" value="$(arg input_topic)"/>
-    <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
     <arg name="camera_info_topic" value="$(arg camera_info_topic)"/>
-    <arg name="plane_coefficients_topic" value="$(arg plane_coefficients_topic)"/>
     <arg name="config_file" value="$(arg config_file)"/>
+    <arg name="ground_plane_provider_type" value="$(arg ground_plane_provider_type)"/>
+    <arg name="camera_height" value="$(arg camera_height)"/>
   </include>
 
   <!-- RViz -->

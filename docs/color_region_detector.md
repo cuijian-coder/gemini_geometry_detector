@@ -1,8 +1,8 @@
-> ⚠️ **本文档已过期**：当前 `color_region_detector` 已不再使用 `DepthProjector`，改为直接订阅 OrbbecSDK_ROS1 发布的对齐点云 `/camera/depth_registered/points`。具体用法请参考根目录 `README.md`。
+> **注意**：本文档描述当前可插拔引导线估计版本。默认使用 `DepthGuideLineEstimator`（地平面 3D 拟合），同时保留 `FitLineGuideLineEstimator`（RGB-only 图像平面拟合）作为备选。Depth 模式所需的地面平面来源通过 `IGroundPlaneProvider` 接口解耦，支持话题订阅或 IMU 重力估计。
 
 # color_region_detector 算法逻辑说明
 
-本文档结合源码，梳理 `color_region_detector` 从 RGB-D 图像输入到 3D 轮廓输出的完整算法流程，并对每个关键逻辑节点进行说明。
+本文档结合源码，梳理 `color_region_detector` 从 RGB 图像输入到引导线误差的完整算法流程。引导线估计算法通过 `IGuideLineEstimator` 接口解耦，地面平面来源通过 `IGroundPlaneProvider` 接口解耦。
 
 ---
 
@@ -10,31 +10,33 @@
 
 ```text
 输入数据
-    │  ├─ /camera/color/image_raw   (sensor_msgs/Image)
-    │  ├─ /camera/depth/image_raw   (sensor_msgs/Image)
-    │  └─ /camera/color/camera_info (sensor_msgs/CameraInfo)
+    │  ├─ /camera/color/image_raw          (sensor_msgs/Image)
+    │  ├─ /camera/color/camera_info        (sensor_msgs/CameraInfo)
+    │  ├─ /tf                              (base_link → camera_color_optical_frame)
+    │  ├─ /ground_plane/coefficients       (ground_plane_calibrator/PlaneCoefficients, topic provider)
+    │  └─ /camera/gyro_accel/sample        (sensor_msgs/Imu, imu provider)
     ▼
-[RGB-D Sync] message_filters::ApproximateTime 同步
-    │
-    ▼
-[ColorRegionDetector::rgbDepthInfoCallback]
-    │  ├─ cv_bridge 解码 RGB 和 Depth
+[ColorRegionDetector::rgbCallback]
+    │  ├─ 根据 guide_line_estimator_type 创建 IGuideLineEstimator
+    │  ├─ 根据 ground_plane_provider_type 创建 IGroundPlaneProvider（Depth 模式）
+    │  ├─ cv_bridge 解码 RGB
     │  ├─ BGR → HSV 颜色空间转换
     │  ├─ HSV 阈值分割 → 二值掩码
     │  ├─ 形态学开/闭运算去噪
     │  ├─ findContours 提取外轮廓
     │  ├─ 面积过滤 + 计算 2D 中心/包围盒
-    │  ├─ DepthProjector::projectContour
-    │  │    ├─ 查中心点深度 Z
-    │  │    ├─ 用 fx/fy/cx/cy 投影到 3D
-    │  │    └─ 计算 mean/min/max depth
+    │  ├─ TF 自动计算 target_angle（启动一次）
+    │  ├─ 调用 IGuideLineEstimator::estimate()
+    │  │    ├─ FitLine: 归一化图像平面 + cv::fitLine
+    │  │    └─ Depth: 反投影 + 地平面 PCA 直线
+    │  ├─ 计算 yaw_error / lateral_error_n / lateral_error_m
     │  └─ 绘制标注图并发布
     ▼
 [输出]
     │  ├─ /gemini_geometry_detector/color/mask
     │  ├─ /gemini_geometry_detector/color/annotated
     │  ├─ /gemini_geometry_detector/color/contours
-    │  └─ /gemini_geometry_detector/color/contours_3d
+    │  └─ /gemini_geometry_detector/color/guide_line_error
     ▼
 输出
 ```
@@ -42,7 +44,6 @@
 ROS 入口：
 - `src/color_region_detector_node.cpp`
 - 主类：`ColorRegionDetector`（`include/gemini_geometry_detector/color_region_detector.h`）
-- 3D 投影类：`DepthProjector`（`include/gemini_geometry_detector/depth_projector.h`）
 
 ---
 
@@ -56,12 +57,16 @@ ROS 入口：
 | v (y) | 下 | 图像垂直方向，单位：像素 |
 | 原点 | 左上角 | `(u=0, v=0)` 为图像左上角 |
 
-因此：
-- `center.x` 表示轮廓中心在图像中的水平像素坐标。
-- `center.y` 表示轮廓中心在图像中的垂直像素坐标。
-- `bbox_tl` / `bbox_br` 分别表示包围盒的左上角和右下角像素坐标。
+归一化图像平面坐标：
 
-注意：这是**二维图像坐标系**。Phase 2 已经结合 `camera_info` 和深度图把轮廓中心/采样点转换到 `camera_color_optical_frame` 三维坐标系；Phase 3 会进一步转换到 `base_link` / `map`。
+```text
+x_n = (u - cx) / fx
+y_n = (v - cy) / fy
+```
+
+- `fx`、`fy`：相机焦距（像素）。
+- `cx`、`cy`：主点（像素）。
+- 归一化坐标中心为 `(0, 0)`，因此 `lateral_error_n` 直接等于 ROI 行处的 `x_n`。
 
 ---
 
@@ -72,58 +77,54 @@ ROS 入口：
 源码：`src/color_region_detector.cpp` → `ColorRegionDetector::ColorRegionDetector()`
 
 ```cpp
-rgb_sub_filter_.subscribe(it_, input_topic_, 1);
-depth_sub_.subscribe(nh_, depth_topic_, 1);
-info_sub_.subscribe(nh_, camera_info_topic_, 1);
-
-sync_.reset(new message_filters::Synchronizer<SyncPolicy>(
-    SyncPolicy(10), rgb_sub_filter_, depth_sub_, info_sub_));
-sync_->registerCallback(
-    boost::bind(&ColorRegionDetector::rgbDepthInfoCallback, this, _1, _2, _3));
+rgb_sub_ = it_.subscribe(input_topic_, 1,
+                         &ColorRegionDetector::rgbCallback, this);
+camera_info_sub_ = nh_.subscribe(camera_info_topic_, 1,
+                                 &ColorRegionDetector::cameraInfoCallback, this);
 ```
 
-订阅 RGB-D 同步输入：
+订阅输入：
 
 | 数据 | 默认话题 | 类型 |
 |---|---|---|
 | RGB | `/camera/color/image_raw` | `sensor_msgs/Image` |
-| Depth | `/camera/depth/image_raw` | `sensor_msgs/Image` |
 | CameraInfo | `/camera/color/camera_info` | `sensor_msgs/CameraInfo` |
 
-### 3.2 RGB-D 同步回调
+### 3.2 RGB 回调
 
-源码：`src/color_region_detector.cpp` → `rgbDepthInfoCallback()`
+源码：`src/color_region_detector.cpp` → `rgbCallback()`
 
 ```cpp
-void ColorRegionDetector::rgbDepthInfoCallback(
-    const sensor_msgs::ImageConstPtr& rgb_msg,
-    const sensor_msgs::ImageConstPtr& depth_msg,
-    const sensor_msgs::CameraInfoConstPtr& info_msg)
+void ColorRegionDetector::rgbCallback(const sensor_msgs::ImageConstPtr& rgb_msg)
 {
   cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
-  cv_depth = cv_bridge::toCvShare(depth_msg);
-  processFrame(rgb_msg, cv_rgb->image, cv_depth->image, info_msg);
+  processFrame(rgb_msg, cv_rgb->image);
 }
 ```
 
 **逻辑说明**：
-- 使用 `message_filters::sync_policies::ApproximateTime` 同步 RGB、Depth、CameraInfo。
-- 同步后统一处理一帧数据，保证 RGB 像素和 Depth 像素对应。
-- 如果 RGB 和 Depth 分辨率不一致，会打印 WARN。
+- 不再同步点云，只接收 RGB 图像。
+- RGB 期望编码为 `BGR8`；如果编码不匹配会抛出异常并打印 ERROR。
 
-### 3.3 cv_bridge 解码
+### 3.3 CameraInfo 回调
 
-源码：`src/color_region_detector.cpp` → `rgbDepthInfoCallback()`
+源码：`src/color_region_detector.cpp` → `cameraInfoCallback()`
 
 ```cpp
-cv_rgb = cv_bridge::toCvShare(rgb_msg, sensor_msgs::image_encodings::BGR8);
-cv_depth = cv_bridge::toCvShare(depth_msg);
+void ColorRegionDetector::cameraInfoCallback(
+    const sensor_msgs::CameraInfoConstPtr& info_msg)
+{
+  const auto& k = info_msg->K;
+  camera_intrinsics_.fx = static_cast<float>(k[0]);
+  camera_intrinsics_.fy = static_cast<float>(k[4]);
+  camera_intrinsics_.cx = static_cast<float>(k[2]);
+  camera_intrinsics_.cy = static_cast<float>(k[5]);
+}
 ```
 
 **逻辑说明**：
-- RGB 期望编码为 `BGR8`。
-- Depth 支持 `16UC1`（毫米）和 `32FC1`（米），由 `DepthProjector` 自动判断。
-- 期望输入编码为 `BGR8`；如果编码不匹配会抛出异常并打印 ERROR。
+- 缓存原始相机内参。
+- 缩放后的图像坐标由估计算法内部自行处理（`FitLineGuideLineEstimator` 忽略内参；`DepthGuideLineEstimator` 在 `configure()` 中按 `image_scale_` 缩放内参）。
 
 ---
 
@@ -138,7 +139,8 @@ cv::Mat ColorRegionDetector::createColorMask(const cv::Mat& bgr_image)
   cv::cvtColor(bgr_image, hsv, cv::COLOR_BGR2HSV);
 
   cv::Mat mask;
-  cv::inRange(hsv, cv::Scalar(h_min_, s_min_, v_min_), cv::Scalar(h_max_, s_max_, v_max_), mask);
+  cv::inRange(hsv, cv::Scalar(h_min_, s_min_, v_min_),
+              cv::Scalar(h_max_, s_max_, v_max_), mask);
   return mask;
 }
 ```
@@ -218,10 +220,11 @@ void ColorRegionDetector::detectContours(const cv::Mat& mask,
 ```cpp
 bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour,
                                            int id,
-                                           ContourInfo& info)
+                                           ContourInfo& info,
+                                           double min_contour_area)
 {
   double area = cv::contourArea(contour);
-  if (area < min_contour_area_)
+  if (area < min_contour_area)
   {
     return false;
   }
@@ -235,16 +238,7 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
   }
 
   cv::Rect bbox = cv::boundingRect(contour);
-
-  info.id = id;
-  info.center.x = center.x;
-  info.center.y = center.y;
-  info.area = area;
-  info.bbox_tl.x = bbox.x;
-  info.bbox_tl.y = bbox.y;
-  info.bbox_br.x = bbox.x + bbox.width;
-  info.bbox_br.y = bbox.y + bbox.height;
-  // ... 下采样轮廓点
+  // ... 填充 ContourInfo
   return true;
 }
 ```
@@ -267,148 +261,184 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 | `bbox_br` | `geometry_msgs/Point` | 包围盒右下角 `(u, v, 0)` |
 | `points` | `geometry_msgs/Point32[]` | 下采样后的轮廓点序列 |
 
-### 6.3 主处理流程中的统计
+---
 
-源码：`src/color_region_detector.cpp` → `processFrame()`
+## 7. 引导线拟合与误差计算
+
+### 7.1 选取最大轮廓
+
+源码：`src/color_region_detector.cpp` → `findLargestContour()`
+
+**逻辑说明**：
+- 遍历所有外轮廓，按面积排序，返回面积最大且满足最小面积阈值的轮廓。
+- 控制计算只基于该最大轮廓，减少多目标干扰。
+
+### 7.2 矩形近似（仅可视化）
+
+源码：`src/color_region_detector.cpp` → `getRectangularContour()`
+
+**逻辑说明**：
+- 对 `largest_contour` 调用 `cv::minAreaRect` 得到最小外接矩形。
+- 该矩形**仅用于在 annotated 图上可视化**，不参与控制计算。
+- 因为透视效应，地面引导线在图像中可能是梯形或不规则四边形，强扭成矩形会引入误差，因此控制使用原始轮廓点直接拟合。
+
+### 7.3 归一化轮廓点
+
+源码：`src/color_region_detector.cpp` → `normalizeContourPoints()`
 
 ```cpp
-int filtered_count = 0;
-int depth_filtered_count = 0;
-for (const auto& contour : contours)
+for (const auto& pt : contour)
 {
-  ContourInfo info_2d;
-  if (!buildContourInfo(contour, id, info_2d))
-  {
-    ++filtered_count;
-    continue;
-  }
-
-  drawContourOnImage(annotated, contour, info_2d);
-  contour_array.contours.push_back(info_2d);
-
-  Contour3DInfo info_3d;
-  info_3d.id = info_2d.id;
-  // ... copy 2D fields
-  if (depth_projector_.projectContour(contour, depth_image, info_3d,
-                                      sample_3d_step_, publish_points_3d_))
-  {
-    contour_3d_array.contours.push_back(info_3d);
-  }
-  else
-  {
-    ++depth_filtered_count;
-  }
+  float x_n = (pt.x - cx) / fx;
+  float y_n = (pt.y - cy) / fy;
+  normalized_points.emplace_back(x_n, y_n);
 }
 ```
 
 **逻辑说明**：
-- 遍历所有外轮廓，过滤掉小面积轮廓。
-- 对每个有效 2D 轮廓调用 `DepthProjector` 投影到 3D。
-- 深度无效（超出范围或中心点无深度）的轮廓被过滤。
+- 把像素坐标转换到归一化图像平面。
+- 如果轮廓点数量超过 `max_contour_points`，则均匀采样。
 
-### 6.4 3D 投影（DepthProjector）
+### 7.4 中心线拟合
 
-源码：`src/depth_projector.cpp` → `DepthProjector::projectContour()` / `projectPixel()`
-
-#### 6.4.1 相机内参设置
+源码：`src/color_region_detector.cpp` → `fitCenterLineNormalized()`
 
 ```cpp
-void DepthProjector::setCameraInfo(const sensor_msgs::CameraInfoConstPtr& camera_info)
-{
-  fx_ = camera_info->K[0];
-  fy_ = camera_info->K[4];
-  cx_ = camera_info->K[2];
-  cy_ = camera_info->K[5];
-}
-```
-
-#### 6.4.2 深度值转换
-
-```cpp
-bool DepthProjector::convertDepthValue(const cv::Mat& depth_image, int u, int v, float& depth_m) const
-{
-  if (depth_image.type() == CV_16UC1)
-  {
-    uint16_t raw = depth_image.at<uint16_t>(v, u);
-    depth_m = static_cast<float>(raw) * depth_scale_;
-  }
-  else if (depth_image.type() == CV_32FC1)
-  {
-    depth_m = depth_image.at<float>(v, u);
-  }
-  return isDepthValid(depth_m);
-}
-```
-
-#### 6.4.3 单像素投影
-
-```cpp
-bool DepthProjector::projectPixel(int u, int v, const cv::Mat& depth_image,
-                                  float& X, float& Y, float& Z) const
-{
-  if (!convertDepthValue(depth_image, u, v, Z)) return false;
-  X = (u - cx_) * Z / fx_;
-  Y = (v - cy_) * Z / fy_;
-  return true;
-}
-```
-
-#### 6.4.4 轮廓投影
-
-```cpp
-bool DepthProjector::projectContour(const std::vector<cv::Point>& contour_2d,
-                                    const cv::Mat& depth_image,
-                                    Contour3DInfo& info,
-                                    int sample_step,
-                                    bool publish_points_3d) const
-{
-  // 1. 投影中心点
-  // 2. 采样轮廓点并投影
-  // 3. 计算 mean/min/max depth
-}
+cv::fitLine(normalized_points, line, cv::DIST_L2, 0, 0.01, 0.01);
 ```
 
 **逻辑说明**：
-- 先用图像矩计算 2D 中心 `(u, v)`，查询深度后投影到 3D。
-- 按 `sample_step` 采样轮廓点，逐一投影。
-- 过滤掉深度不在 `[min_depth_m, max_depth_m]` 范围内的轮廓。
+- 在归一化图像平面拟合直线，输出 `(vx, vy, x0, y0)`。
+- 由于坐标已经归一化，拟合结果对相机分辨率/焦距具有不变性。
 
-#### 6.4.5 投影公式
+### 7.5 横向误差
 
-```text
-X = (u - cx) * Z / fx
-Y = (v - cy) * Z / fy
-Z = depth(u, v)
+源码：`src/color_region_detector.cpp` → `computeLateralErrorN()`
+
+```cpp
+roi_y_pixel = roi_y_ratio_ * image_rows;
+roi_y_n     = (roi_y_pixel - cy) / fy;
+x_roi_n     = x0_n + (roi_y_n - y0_n) * vx / vy;
+lateral_error_n = x_roi_n;
 ```
 
-坐标系为 `camera_color_optical_frame`，单位：米。
+**逻辑说明**：
+- 默认在图像下方 75% 处取 ROI 行。
+- 在 ROI 行处求中心线 x 坐标，得到归一化横向误差。
+- 归一化图像平面中心为 `0`，因此 `lateral_error_n` 直接等于 `x_roi_n`。
+- 正值表示引导线在图像中心右侧，负值在左侧。
+
+### 7.6 目标方向角（TF 自动计算）
+
+源码：`src/color_region_detector.cpp` → `computeTargetAngleFromTf()` / `ensureTargetAngleComputed()`
+
+```cpp
+geometry_msgs::TransformStamped transform =
+    tf_buffer_.lookupTransform(camera_frame_, base_frame_, ros::Time(0), ...);
+
+Eigen::Quaterniond q(transform.transform.rotation.w,
+                     transform.transform.rotation.x,
+                     transform.transform.rotation.y,
+                     transform.transform.rotation.z);
+Eigen::Vector3d forward_cam = q * Eigen::Vector3d(1.0, 0.0, 0.0);
+
+target_angle_ = atan2(forward_cam.y() / forward_cam.z(),
+                      forward_cam.x() / forward_cam.z());
+```
+
+**逻辑说明**：
+- 车辆在 `base_link` 中的前进方向为 +X。
+- 通过 TF 查询 `base_frame → camera_frame` 的旋转，将该方向投影到相机图像平面。
+- 使用归一化图像坐标计算角度，结果与 `fx/fy` 无关。
+- 只在启动时计算一次，之后固定使用。
+- 如果 TF 查询失败，则回退到 YAML 中配置的 `target_angle`。
+
+### 7.7 方向角误差
+
+源码：`src/fit_line_guide_line_estimator.cpp` → `computeYawError()`
+
+```cpp
+double angle = atan2(line[1], line[0]);
+double error1 = normalizeAngle(angle - target_angle_);
+double error2 = normalizeAngle(angle + M_PI - target_angle_);
+double yaw_error = (abs(error1) < abs(error2)) ? error1 : error2;
+```
+
+**逻辑说明**：
+- 引导线在几何上是**无向**的：`cv::fitLine` 可能返回同一直线的任意一个方向。
+- 因此同时计算两个相反方向的误差，取绝对值较小的那个，保证结果稳定。
+- `yaw_error` 表示当前引导线方向与目标方向的偏差，归一化到 `[-pi/2, pi/2]`。
+
+### 7.8 DepthGuideLineEstimator 地平面拟合
+
+源码：`src/depth_guide_line_estimator.cpp`
+
+当 `guide_line_estimator_type: "DepthGuideLineEstimator"` 时，算法流程为：
+
+1. **地面平面来源**：`ColorRegionDetector` 创建 `IGroundPlaneProvider` 实现（topic 或 imu），并通过回调把平面传给 `DepthGuideLineEstimator::setGroundPlane(normal, d)`。平面方程为 `normal·P + d = 0`。
+2. **反投影**：对 `largest_contour` 的像素点 `(u, v)` 计算归一化射线：
+   ```text
+   ray = ((u - cx) / fx, (v - cy) / fy, 1)
+   ```
+3. **地面交点**：射线 `P = t * ray` 与地面平面 `normal·P + d = 0` 求交：
+   ```text
+   t = -d / (normal · ray)
+   P_ground = t * ray
+   ```
+   只保留 `t > 0`（相机前方）的有效点。
+4. **地平面直线拟合**：对有效地面点做 PCA，取最大特征值对应的特征向量作为地平面直线方向。
+5. **方向对齐**：将直线方向与车辆前进方向（相机 Z 轴在地平面的投影）对齐，避免方向歧义。
+6. **误差计算**：
+   ```text
+   yaw_error       = atan2(dir · left, dir · forward) - target_angle
+   lateral_error_m = signed_distance(look_ahead_reference, ground_line)
+   ```
+   其中 `look_ahead_reference = -d * normal + look_ahead_m * forward`，即相机光心在地平面的投影再向前 `look_ahead_m` 米。
+
+### 7.9 IGroundPlaneProvider 地面平面来源
+
+源码：
+- `include/gemini_geometry_detector/ground_plane_provider_interface.h`
+- `src/topic_ground_plane_provider.cpp`
+- `src/imu_ground_plane_provider.cpp`
+
+#### TopicGroundPlaneProvider
+
+- 订阅 `ground_plane_topic`（默认 `/ground_plane/coefficients`）。
+- 每次收到 `PlaneCoefficients` 后解包为 `(normal, d)` 并回调给 `DepthGuideLineEstimator`。
+
+#### ImuGroundPlaneProvider
+
+- 订阅 `imu_topic`（默认 `/camera/gyro_accel/sample`）。
+- 对 IMU 重力做低通滤波，并按 `imu_to_camera_qx/qy/qz/qw` 旋转到相机坐标系。
+- 计算地面法向量 `normal = -gravity.normalized()`，取 `d = camera_height`。
+- 每次 IMU 回调都通过回调把平面传给 `DepthGuideLineEstimator`。
+
+**逻辑说明**：
+- 控制量直接是车体坐标系下的角度和米制横向偏移，便于下游控制器直接使用。
+- `lateral_error_m > 0` 表示引导线在当前前视参考点的右侧（与 `lateral_error_n` 符号约定一致）。
 
 ---
 
-## 7. 可视化与发布
+## 8. 可视化与发布
 
-### 7.1 在图像上绘制结果
+### 8.1 在图像上绘制结果
 
-源码：`src/color_region_detector.cpp` → `drawContourOnImage()`
+源码：`src/color_region_detector.cpp` → `drawContourOnImage()` / `drawGuideLineErrorOnImage()`
 
-```cpp
-void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
-                                             const std::vector<cv::Point>& contour,
-                                             const ContourInfo& info)
-{
-  cv::Rect bbox(...);
-  cv::drawContours(annotated, std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(0, 255, 0), 2);
-  cv::circle(annotated, cv::Point(...), 4, cv::Scalar(0, 0, 255), -1);
-  cv::rectangle(annotated, bbox, cv::Scalar(255, 0, 0), 2);
-}
-```
-
-**逻辑说明**：
+绘制内容：
 - 绿色线条：轮廓边界。
 - 红色圆点：轮廓中心。
 - 蓝色矩形：轴对齐包围盒。
+- 黄色多边形：`cv::minAreaRect` 最小外接矩形（仅可视化）。
+- 绿色直线：拟合的中心线。
+- 黄色水平线：ROI 行。
+- 红色圆点：ROI 行与中心线的交点。
+- 蓝色圆点：图像中心在 ROI 行的位置。
+- 品红色线段：连接图像中心与 ROI 交点，直观表示横向误差。
+- 文字：`yaw: X.XXX rad`、`lat: X.XXXX`。
 
-### 7.2 发布结果
+### 8.2 发布结果
 
 源码：`src/color_region_detector.cpp` → `publishResults()`
 
@@ -416,73 +446,70 @@ void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
 void ColorRegionDetector::publishResults(const std_msgs::Header& header,
                                          const cv::Mat& mask,
                                          const cv::Mat& annotated,
-                                         const ContourArray& contour_array,
-                                         const Contour3DArray& contour_3d_array)
+                                         const ContourArray& contour_array)
 {
   // mask
-  cv_bridge::CvImage mask_msg;
-  mask_msg.header = header;
-  mask_msg.encoding = sensor_msgs::image_encodings::MONO8;
-  mask_msg.image = mask;
-  mask_pub_.publish(mask_msg.toImageMsg());
-
   // annotated image
-  cv_bridge::CvImage annotated_msg;
-  annotated_msg.header = header;
-  annotated_msg.encoding = sensor_msgs::image_encodings::BGR8;
-  annotated_msg.image = annotated;
-  annotated_pub_.publish(annotated_msg.toImageMsg());
-
   // 2D contours
-  contours_pub_.publish(contour_array);
-
-  // 3D contours
-  contours_3d_pub_.publish(contour_3d_array);
 }
 ```
 
-**逻辑说明**：
-- 掩码和标注图像使用 `cv_bridge` 重新编码为 ROS 图像消息。
-- 2D 和 3D 轮廓消息共享同一 `header`，保证时间戳和 `frame_id` 与输入 RGB 图像一致。
+额外发布：
+- `/gemini_geometry_detector/color/guide_line_error`：
+  - `yaw_error`（rad）
+  - `lateral_error_n`（归一化图像平面横向误差，FitLine 模式有效）
+  - `lateral_error_m`（米制地平面横向误差，Depth 模式有效）
+  - `valid`（是否有效）
+  - `roi_point`（原始图像坐标中的 ROI 交点或 Depth 模式的前视参考点投影）
 
 ---
 
-## 8. 输出话题
+## 9. 输出话题
 
 | Topic | 类型 | 说明 |
 |---|---|---|
 | `/gemini_geometry_detector/color/mask` | `sensor_msgs/Image` | 二值掩码（MONO8） |
-| `/gemini_geometry_detector/color/annotated` | `sensor_msgs/Image` | 带轮廓/中心/包围盒的标注图（BGR8） |
+| `/gemini_geometry_detector/color/annotated` | `sensor_msgs/Image` | 带轮廓、中心线、ROI、误差的标注图（BGR8） |
 | `/gemini_geometry_detector/color/contours` | `gemini_geometry_detector/ContourArray` | 2D 轮廓数组 |
-| `/gemini_geometry_detector/color/contours_3d` | `gemini_geometry_detector/Contour3DArray` | 3D 轮廓数组 |
+| `/gemini_geometry_detector/color/guide_line_error` | `gemini_geometry_detector/GuideLineError` | 引导线角度与横向误差（n/m） |
 
 ---
 
-## 9. 参数说明
+## 10. 参数说明
 
 参数文件：`config/detector.yaml`
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `input_topic` | `/camera/color/image_raw` | RGB 输入话题 |
-| `depth_topic` | `/camera/depth/image_raw` | 深度输入话题 |
 | `camera_info_topic` | `/camera/color/camera_info` | 相机内参话题 |
 | `h_min` / `h_max` | 20 / 40 | HSV 色调范围 |
 | `s_min` / `s_max` | 80 / 255 | HSV 饱和度范围 |
 | `v_min` / `v_max` | 80 / 255 | HSV 亮度范围 |
 | `morph_kernel_size` | 5 | 形态学核大小，0 表示关闭 |
 | `min_contour_area` | 200 | 轮廓最小面积阈值（像素²） |
-| `max_contour_points` | 64 | 2D 轮廓最大点数 |
-| `sample_3d_step` | 5 | 3D 投影采样步长 |
-| `publish_points_3d` | `true` | 是否发布 3D 轮廓点 |
-| `depth_scale` | 0.001 | 16UC1 深度转米比例 |
-| `min_depth_m` / `max_depth_m` | 0.1 / 10.0 | 有效深度范围 |
+| `max_contour_points` | 64 | 轮廓最大点数（拟合 + 发布） |
+| `image_scale` | 0.5 | 颜色检测和引导线拟合的图像缩放比例 |
+| `use_tf_target_angle` | true | 是否通过 TF 自动计算 `target_angle` |
+| `target_angle` | `0.0` / `-pi/2` | 目标线方向（rad），TF 失败时作为回退；Depth 模式为地平面相对车体前向的角，FitLine 模式为图像平面角 |
+| `base_frame` | `base_link` | 车辆坐标系 |
+| `camera_frame` | `camera_color_optical_frame` | 相机光心坐标系 |
+| `roi_y_ratio` | 0.75 | ROI 行相对图像高度的比例（FitLine 模式） |
+| `roi_y` | -1 | ROI 行绝对像素值，`-1` 表示使用 `roi_y_ratio`（FitLine 模式） |
+| `guide_line_estimator_type` | `DepthGuideLineEstimator` | 引导线估计算法 |
+| `look_ahead_m` | 0.0 | Depth 模式下前视参考点距离（m） |
+| `ground_plane_provider_type` | `topic` | 地面平面来源：`topic` / `imu` |
+| `ground_plane_topic` | `ground_plane/coefficients` | topic provider 订阅话题 |
+| `imu_topic` | `/camera/gyro_accel/sample` | imu provider 订阅话题 |
+| `camera_height` | 0.8 | imu provider 相机高度（m） |
+| `gravity_filter_alpha` | 1.0 | imu provider 重力低通滤波系数 |
+| `imu_to_camera_qx/qy/qz/qw` | 0/0/0/1 | imu provider IMU→相机旋转 |
 
 ---
 
-## 10. 调参指南
+## 11. 调参指南
 
-### 10.1 HSV 阈值调节
+### 11.1 HSV 阈值调节
 
 - 目标颜色偏色 → 调整 `h_min` / `h_max`。
   - 黄色通常在 H=15~45 之间。
@@ -490,50 +517,57 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 - 环境中有同色噪声 → 提高 `s_min` 和 `v_min`，让颜色更“纯”、更亮才被认为是目标。
 - 目标区域发暗 → 降低 `v_min`。
 
-### 10.2 形态学调节
+### 11.2 形态学调节
 
 - 掩码有很多小白点噪点 → 增大 `morph_kernel_size` 或保持开运算。
 - 目标区域内部有黑色空洞 → 保持闭运算，可适度增大核。
 - 目标本身很小 → 不要设置太大的核，以免把目标腐蚀掉。
 
-### 10.3 面积过滤调节
+### 11.3 面积过滤调节
 
 - 误检太多小区域 → 增大 `min_contour_area`。
 - 目标远处变小导致漏检 → 减小 `min_contour_area`。
 
+### 11.4 引导线参数调节
 
+- 引导线方向不对 → 调整 `target_angle`。
+- 横向误差响应过晚 → 增大 `roi_y_ratio`（更靠近图像底部）。
+- 横向误差噪声大 → 减小 `roi_y_ratio`（更远离车辆，线更稳定），但响应会滞后。
 
 ---
 
-## 11. 关键源码索引
+## 12. 关键源码索引
 
 | 文件 | 作用 |
 |---|---|
 | `src/color_region_detector_node.cpp` | ROS 节点入口 |
 | `include/gemini_geometry_detector/color_region_detector.h` | `ColorRegionDetector` 类声明 |
-| `src/color_region_detector.cpp` | RGB-D 同步、颜色分割、轮廓检测、发布 |
-| `include/gemini_geometry_detector/depth_projector.h` | `DepthProjector` 类声明 |
-| `src/depth_projector.cpp` | 深度解析、2D→3D 投影 |
-| `config/detector.yaml` | HSV / 形态学 / 深度 / 3D 参数配置 |
+| `src/color_region_detector.cpp` | RGB 处理、轮廓检测、算法调度、发布 |
+| `src/fit_line_guide_line_estimator.cpp` | RGB 图像平面引导线估计算法实现 |
+| `src/depth_guide_line_estimator.cpp` | 地平面 3D 引导线估计算法实现 |
+| `src/topic_ground_plane_provider.cpp` | 话题地面平面来源实现 |
+| `src/imu_ground_plane_provider.cpp` | IMU 地面平面来源实现 |
+| `include/gemini_geometry_detector/guide_line_estimator_interface.h` | 引导线估计算法接口 |
+| `include/gemini_geometry_detector/ground_plane_provider_interface.h` | 地面平面来源接口 |
+| `include/gemini_geometry_detector/fit_line_guide_line_estimator.h` | RGB 实现类声明 |
+| `include/gemini_geometry_detector/depth_guide_line_estimator.h` | 深度实现类声明 |
+| `include/gemini_geometry_detector/topic_ground_plane_provider.h` | topic provider 类声明 |
+| `include/gemini_geometry_detector/imu_ground_plane_provider.h` | imu provider 类声明 |
+| `config/detector.yaml` | HSV / 形态学 / 引导线参数配置 |
 | `launch/color_detector.launch` | 单独启动检测节点 |
 | `launch/color_detector_rviz.launch` | 启动检测节点 + RViz |
 | `rviz/color_detector.rviz` | RViz 配置文件 |
 | `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
-| `msg/Contour3DInfo.msg` / `Contour3DArray.msg` | 3D 轮廓消息 |
+| `msg/GuideLineError.msg` | 引导线误差消息 |
 
 ---
 
-## 12. 后续扩展提示
+## 13. 后续扩展提示
 
-Phase 3 可进一步：
-- 订阅 `/tf`，把 `camera_color_optical_frame` 下的 3D 轮廓转换到 `base_link` / `map`。
-- 对 3D 轮廓点做 PCA/RANSAC 拟合 3D 直线或 2D 地面线。
+- Depth 模式下，下游控制器可直接使用米制误差：
+  ```text
+  angular_z = -Kp_yaw * yaw_error - Kp_lateral * lateral_error_m
+  ```
+- FitLine 模式下，如需车体坐标系控制，可额外订阅 `/tf` 转换图像平面误差。
+- 需要新的地面平面来源时，实现 `IGroundPlaneProvider` 接口并在 `ColorRegionDetector` 中注册即可。
 - 与地图线匹配，计算车体到目标线的横向距离。
-
-核心公式已经具备：
-
-```text
-X = (u - cx) * Z / fx
-Y = (v - cy) * Z / fy
-Z = depth(u, v)
-```

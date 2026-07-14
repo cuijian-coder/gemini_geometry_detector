@@ -11,23 +11,20 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   cv_bridge
   image_transport
-  message_filters
   message_generation
-  pcl_conversions
-  visualization_msgs
+  tf2
+  tf2_ros
   ground_plane_calibrator
 )
 
 find_package(OpenCV REQUIRED)
-find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_message_files(
   FILES
   ContourInfo.msg
   ContourArray.msg
-  Contour3DInfo.msg
-  Contour3DArray.msg
+  GuideLineError.msg
 )
 
 generate_messages(
@@ -45,10 +42,9 @@ catkin_package(
     geometry_msgs
     cv_bridge
     image_transport
-    message_filters
     message_runtime
-    pcl_conversions
-    visualization_msgs
+    tf2
+    tf2_ros
     ground_plane_calibrator
   DEPENDS OpenCV
 )
@@ -57,26 +53,26 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
 
 add_executable(color_region_detector_node
   src/color_region_detector_node.cpp
   src/color_region_detector.cpp
-  src/guide_line_estimator.cpp
+  src/fit_line_guide_line_estimator.cpp
+  src/depth_guide_line_estimator.cpp
+  src/topic_ground_plane_provider.cpp
+  src/imu_ground_plane_provider.cpp
 )
 
 add_dependencies(color_region_detector_node
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
-  ground_plane_calibrator_generate_messages_cpp
 )
 
 target_link_libraries(color_region_detector_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
-  ${PCL_LIBRARIES}
 )
 
 install(TARGETS color_region_detector_node

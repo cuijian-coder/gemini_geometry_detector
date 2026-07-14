@@ -17,17 +17,66 @@ morph_kernel_size: 5
 # Minimum contour area in pixels to be considered valid
 min_contour_area: 200
 
-# Maximum number of contour points to publish per contour (0 = all, downsample if >0)
+# Maximum number of contour points to use for line fitting and publishing
+# (0 = all, downsample if >0)
 max_contour_points: 64
 
-# Image scale for color detection and guide-line estimation (0.5 = 640x400 for 1280x800 input)
-image_scale: 0.5
+# Image scale for color detection and guide-line estimation
+# (0.5 = 640x400 for 1280x800 input)
+image_scale: 1
 
-# Compute the 3D guide line only every N frames (1 = every frame)
-guide_line_every_n: 1
+# If true, compute target_angle automatically from TF by projecting the
+# vehicle forward axis (+X of base_frame) into the camera image plane.
+# If false, use the manually configured target_angle below.
+use_tf_target_angle: false
+
+# Fallback target direction of the guide line (rad).
+# Only used when use_tf_target_angle is false.
+# Semantics depend on the selected estimator:
+#   - FitLineGuideLineEstimator: angle in the normalized image plane.
+#     A line going straight away from the robot points upward: atan2(-1, 0) = -pi/2.
+#   - DepthGuideLineEstimator: angle on the ground plane relative to the
+#     vehicle forward direction. For normal line following, set to 0.0.
+target_angle: 0.0
+
+# TF frames for automatic target_angle computation.
+base_frame: base_link
+camera_frame: camera_color_optical_frame
+
+# ROI row for lateral-error evaluation, as a ratio of image height.
+# 0.75 means evaluate near the bottom of the image (close to the robot).
+roi_y_ratio: 0.75
+
+# Absolute ROI row in scaled image pixels. Set to -1 to use roi_y_ratio instead.
+roi_y: -1
+
+# Guide-line estimator implementation.
+# - "DepthGuideLineEstimator": back-project to ground plane using depth/camera intrinsics
+#   and an external ground plane (default).
+# - "FitLineGuideLineEstimator": pure RGB image-plane fitting.
+guide_line_estimator_type: "DepthGuideLineEstimator"
+
+# Distance ahead of the camera origin on the ground plane at which to evaluate
+# lateral error (meters). Only used by DepthGuideLineEstimator.
+look_ahead_m: 0.0
+
+# Ground-plane source provider. Only used by DepthGuideLineEstimator.
+# - "topic": subscribe to ground_plane_calibrator/PlaneCoefficients (default).
+# - "imu": estimate the plane from IMU gravity and a fixed camera height.
+ground_plane_provider_type: "topic"
+
+# Topic provider parameters.
+ground_plane_topic: "ground_plane/coefficients"
+
+# IMU provider parameters (only used when ground_plane_provider_type is "imu").
+imu_topic: "/camera/gyro_accel/sample"
+camera_height: 0.14
+gravity_filter_alpha: 1.0
+imu_to_camera_qx: 0.0
+imu_to_camera_qy: 0.0
+imu_to_camera_qz: 0.0
+imu_to_camera_qw: 1.0
 
 # Input topics
 input_topic: /camera/color/image_raw
-point_cloud_topic: /camera/depth_registered/points
 camera_info_topic: /camera/color/camera_info
-plane_coefficients_topic: /ground_plane_calibrator/ground_plane/coefficients

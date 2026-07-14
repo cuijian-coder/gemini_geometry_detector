@@ -2,7 +2,7 @@
 <package format="2">
   <name>gemini_geometry_detector</name>
   <version>0.1.0</version>
-  <description>RGB-D color region detection and 3D contour extraction</description>
+  <description>RGB color region detection and image-plane guide-line error estimation</description>
   <maintainer email="jiancui1804@example.com">jiancui1804</maintainer>
   <license>MIT</license>
 
@@ -14,10 +14,9 @@
   <build_depend>geometry_msgs</build_depend>
   <build_depend>cv_bridge</build_depend>
   <build_depend>image_transport</build_depend>
-  <build_depend>message_filters</build_depend>
   <build_depend>message_generation</build_depend>
-  <build_depend>pcl_conversions</build_depend>
-  <build_depend>visualization_msgs</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_ros</build_depend>
   <build_depend>ground_plane_calibrator</build_depend>
 
   <exec_depend>roscpp</exec_depend>
@@ -26,10 +25,9 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>image_transport</exec_depend>
-  <exec_depend>message_filters</exec_depend>
   <exec_depend>message_runtime</exec_depend>
-  <exec_depend>pcl_conversions</exec_depend>
-  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>ground_plane_calibrator</exec_depend>
 
   <export>

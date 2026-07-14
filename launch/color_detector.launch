@@ -1,22 +1,25 @@
 <launch>
-  <!-- Launch file for color region detection and ground cloud extraction -->
+  <!-- Launch file for color region detection and guide-line error estimation -->
 
   <arg name="input_topic" default="/camera/color/image_raw"/>
-  <arg name="point_cloud_topic" default="/camera/depth_registered/points"/>
   <arg name="camera_info_topic" default="/camera/color/camera_info"/>
-  <arg name="plane_coefficients_topic"
-       default="/ground_plane_calibrator/ground_plane/coefficients"/>
   <arg name="output_ns" default="gemini_geometry_detector"/>
   <arg name="config_file"
        default="$(find gemini_geometry_detector)/config/detector.yaml"/>
 
+  <!-- Ground-plane provider override (topic/imu). Empty means use config file value. -->
+  <arg name="ground_plane_provider_type" default=""/>
+  <arg name="camera_height" default=""/>
+
   <group ns="$(arg output_ns)">
     <node name="color_region_detector" pkg="gemini_geometry_detector" type="color_region_detector_node" output="screen">
       <param name="input_topic" value="$(arg input_topic)"/>
-      <param name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
       <param name="camera_info_topic" value="$(arg camera_info_topic)"/>
-      <param name="plane_coefficients_topic" value="$(arg plane_coefficients_topic)"/>
       <rosparam file="$(arg config_file)" command="load"/>
+      <param if="$(eval arg('ground_plane_provider_type') != '')"
+             name="ground_plane_provider_type" value="$(arg ground_plane_provider_type)"/>
+      <param if="$(eval arg('camera_height') != '')"
+             name="camera_height" value="$(arg camera_height)"/>
     </node>
   </group>
 </launch>
