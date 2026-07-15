@@ -12,18 +12,35 @@ s_max: 255
 v_max: 255
 
 # Morphological operation kernel size (odd number, 0 to disable)
-morph_kernel_size: 5
+morph_kernel_size: 7
 
-# Minimum contour area in pixels to be considered valid
-min_contour_area: 200
+# Minimum contour length (arc length) in pixels to be considered valid.
+# A thin horizontal line has a very small area but can still be long, so using
+# arc length instead of area avoids filtering it out.
+min_contour_length: 50
 
 # Maximum number of contour points to use for line fitting and publishing
 # (0 = all, downsample if >0)
 max_contour_points: 64
 
+# Aspect ratio filter (long side / short side of the axis-aligned bounding box).
+# Used to reject non-line-shaped blobs. Set min >= 1.0.
+# Set max_aspect_ratio <= 0 to disable the upper bound.
+min_aspect_ratio: 1.0
+max_aspect_ratio: 0.0
+
+# Contour merging for broken guide lines.
+# When enabled, valid contours are grouped by direction and normalized
+# bounding-box nearest distance; each group is concatenated into an additional
+# merged contour.
+enable_contour_merging: true
+merge_max_angle_diff_deg: 5.0
+merge_max_region_gap_n: 0.1
+
+
 # Image scale for color detection and guide-line estimation
 # (0.5 = 640x400 for 1280x800 input)
-image_scale: 1
+image_scale: 1.0
 
 # If true, compute target_angle automatically from TF by projecting the
 # vehicle forward axis (+X of base_frame) into the camera image plane.

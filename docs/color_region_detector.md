@@ -213,7 +213,7 @@ void ColorRegionDetector::detectContours(const cv::Mat& mask,
 - 只检测最外层轮廓（`RETR_EXTERNAL`），不处理轮廓嵌套。
 - 使用 `CHAIN_APPROX_SIMPLE` 压缩水平、垂直、对角线段，减少轮廓点数量。
 
-### 6.2 轮廓信息构建与面积过滤
+### 6.2 轮廓信息构建与长度过滤
 
 源码：`src/color_region_detector.cpp` → `buildContourInfo()`
 
@@ -221,10 +221,10 @@ void ColorRegionDetector::detectContours(const cv::Mat& mask,
 bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour,
                                            int id,
                                            ContourInfo& info,
-                                           double min_contour_area)
+                                           double min_contour_length)
 {
-  double area = cv::contourArea(contour);
-  if (area < min_contour_area)
+  const double length = cv::arcLength(contour, true);
+  if (length < min_contour_length)
   {
     return false;
   }
@@ -244,11 +244,16 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 ```
 
 **逻辑说明**：
-1. 计算轮廓面积 `cv::contourArea`。
-2. 若面积小于 `min_contour_area`（默认 200 像素），直接丢弃。
+1. 计算轮廓周长 `cv::arcLength(contour, true)`。
+2. 若周长小于 `min_contour_length`（默认 50 像素），直接丢弃。
+   - 使用长度而非面积，可以避免细长的水平引导线因面积过小而误过滤。
 3. 通过图像矩 `cv::moments` 计算轮廓中心（一阶矩 / 零阶矩）。
 4. 计算轴对齐包围盒 `cv::boundingRect`。
-5. 对轮廓点进行下采样（默认最多保留 64 个点），减少消息体积。
+5. 计算长宽比 `aspect_ratio = max(width, height) / min(width, height)`。
+   - 若小于 `min_aspect_ratio`（默认 1.0，即无过滤），丢弃。
+   - 若大于 `max_aspect_ratio`（默认 0.0，表示不启用上限），丢弃。
+   - 该过滤用于剔除近似圆形或方形的非线状噪声区域。
+6. 对轮廓点进行下采样（默认最多保留 64 个点），减少消息体积。
 
 `ContourInfo` 消息字段：
 
@@ -260,6 +265,26 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 | `bbox_tl` | `geometry_msgs/Point` | 包围盒左上角 `(u, v, 0)` |
 | `bbox_br` | `geometry_msgs/Point` | 包围盒右下角 `(u, v, 0)` |
 | `points` | `geometry_msgs/Point32[]` | 下采样后的轮廓点序列 |
+
+### 6.3 轮廓合并（可选）
+
+源码：`src/color_region_detector.cpp` → `mergeContours()` / `computeContourFeatures()`
+
+**启用条件**：`enable_contour_merging: true`，且已收到有效的 `CameraInfo`。
+
+**逻辑说明**：
+1. 对**已通过面积和长宽比过滤**的轮廓，分别计算：
+   - 归一化图像平面中心 `center_n`。
+   - 归一化图像平面方向角 `angle`，由 `cv::fitLine` 在归一化坐标上拟合得到。
+   - 轴对齐包围盒 `bbox`（缩放后的像素坐标）。
+2. 对每对有效轮廓判断是否满足合并条件：
+   - 方向角差异 `angle_diff < merge_max_angle_diff_deg`（默认 15°）。
+   - 包围盒最近距离 `region_gap < merge_max_region_gap_n`（默认 0.1，约 60 像素@fx≈613）。该距离通过 `computeNormalizedBboxGap()` 在归一化图像平面上计算：先分别求两个 bbox 在 x/y 方向上的间隙，再取欧氏距离；若 bbox 有重叠则间隙为 0。
+3. 使用并查集把满足条件的轮廓归为一组。
+4. 对包含多个轮廓的组，把原始像素点拼接成一个新轮廓。
+5. 新轮廓**追加**到原始轮廓列表末尾，后续一起经过 `buildContourInfo`、绘制、发布和最大轮廓选取。
+
+> 注意：合并后的轮廓是“新增”而不是“替换”，因此 `ContourArray` 中会同时看到原始轮廓和合并后的轮廓。
 
 ---
 
@@ -487,8 +512,13 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `s_min` / `s_max` | 80 / 255 | HSV 饱和度范围 |
 | `v_min` / `v_max` | 80 / 255 | HSV 亮度范围 |
 | `morph_kernel_size` | 5 | 形态学核大小，0 表示关闭 |
-| `min_contour_area` | 200 | 轮廓最小面积阈值（像素²） |
+| `min_contour_length` | 50 | 轮廓最小周长阈值（像素） |
 | `max_contour_points` | 64 | 轮廓最大点数（拟合 + 发布） |
+| `min_aspect_ratio` | 1.0 | 轮廓最小长宽比（长边/短边） |
+| `max_aspect_ratio` | 0.0 | 轮廓最大长宽比，`<=0` 表示不限制 |
+| `enable_contour_merging` | false | 是否启用断裂轮廓合并 |
+| `merge_max_angle_diff_deg` | 15.0 | 合并方向角差异阈值（°） |
+| `merge_max_region_gap_n` | 0.1 | 合并包围盒最近归一化距离阈值 |
 | `image_scale` | 0.5 | 颜色检测和引导线拟合的图像缩放比例 |
 | `use_tf_target_angle` | true | 是否通过 TF 自动计算 `target_angle` |
 | `target_angle` | `0.0` / `-pi/2` | 目标线方向（rad），TF 失败时作为回退；Depth 模式为地平面相对车体前向的角，FitLine 模式为图像平面角 |
@@ -523,12 +553,20 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 - 目标区域内部有黑色空洞 → 保持闭运算，可适度增大核。
 - 目标本身很小 → 不要设置太大的核，以免把目标腐蚀掉。
 
-### 11.3 面积过滤调节
+### 11.3 长度过滤调节
 
-- 误检太多小区域 → 增大 `min_contour_area`。
-- 目标远处变小导致漏检 → 减小 `min_contour_area`。
+- 误检太多短线段 → 增大 `min_contour_length`。
+- 目标远处变短导致漏检 → 减小 `min_contour_length`。
+- 细长水平线被过滤 → 确认 `min_contour_length` 是否过小；当前使用周长而非面积，已经缓解该问题。
 
-### 11.4 引导线参数调节
+### 11.4 轮廓合并参数调节
+
+- 引导线断裂成多段 → 启用 `enable_contour_merging: true`。
+- 合并过多、把不同目标连起来 → 减小 `merge_max_region_gap_n` 或收紧 `merge_max_angle_diff_deg`。
+- 同一条线有间距但未合并 → 增大 `merge_max_region_gap_n`（该距离同时包含 x/y 方向间隙）。
+- 弯道导致两段线方向不一致 → 适当放宽 `merge_max_angle_diff_deg`（但会引入误合并风险）。
+
+### 11.5 引导线参数调节
 
 - 引导线方向不对 → 调整 `target_angle`。
 - 横向误差响应过晚 → 增大 `roi_y_ratio`（更靠近图像底部）。

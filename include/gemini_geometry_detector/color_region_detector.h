@@ -22,8 +22,24 @@
 #include "gemini_geometry_detector/ContourArray.h"
 #include "gemini_geometry_detector/GuideLineError.h"
 
+#include <opencv2/core/types.hpp>
+
 namespace gemini_geometry_detector
 {
+
+/**
+ * @brief Features of a contour used for merge decisions.
+ *
+ * All geometric quantities are in the normalized image plane, making the merge
+ * thresholds independent of image resolution and focal length.
+ */
+struct NormalizedContourFeatures
+{
+  cv::Point2f center_n;  ///< Centroid in normalized image plane.
+  double angle = 0.0;    ///< Line angle from cv::fitLine (rad).
+  cv::Rect bbox;         ///< Axis-aligned bounding box in scaled image pixels.
+  bool valid = false;    ///< True if the contour passed area/aspect filters.
+};
 
 /**
  * @brief Detects a colored guide region in the RGB image and estimates
@@ -61,7 +77,7 @@ private:
                     const cv::Mat& bgr_image);
 
   std::vector<cv::Point> findLargestContour(const std::vector<std::vector<cv::Point>>& contours,
-                                            double min_area) const;
+                                            double min_contour_length) const;
 
   /**
    * @brief Compute a minimum-area rotated rectangle from a contour.
@@ -90,10 +106,45 @@ private:
   bool buildContourInfo(const std::vector<cv::Point>& contour,
                         int id,
                         ContourInfo& info,
-                        double min_contour_area);
+                        double min_contour_length);
+
+  /**
+   * @brief Check whether the bounding box aspect ratio is within the configured
+   *        range. Logs a warning if it is rejected.
+   */
+  bool isAspectRatioValid(const cv::Rect& bbox, int id) const;
+
+  /**
+   * @brief Compute normalized center and line direction for each contour.
+   *
+   * Only contours that pass area and aspect-ratio filtering are marked valid.
+   */
+  std::vector<NormalizedContourFeatures> computeContourFeatures(
+      const std::vector<std::vector<cv::Point>>& contours,
+      double min_contour_length) const;
+
+  /**
+   * @brief Merge contours that belong to the same physical guide line.
+   *
+   * The returned vector contains new contours that are the concatenation of
+   * original contour points. Original contours are NOT modified.
+   */
+  std::vector<std::vector<cv::Point>> mergeContours(
+      const std::vector<std::vector<cv::Point>>& contours,
+      double min_contour_length) const;
+
+  /**
+   * @brief Compute the nearest distance between two axis-aligned bounding boxes
+   *        in the normalized image plane.
+   *
+   * Overlapping boxes return 0.0.
+   */
+  double computeNormalizedBboxGap(const cv::Rect& a, const cv::Rect& b) const;
+
   void drawContourOnImage(cv::Mat& annotated,
                           const std::vector<cv::Point>& contour,
-                          const ContourInfo& info);
+                          const ContourInfo& info,
+                          bool is_merged = false);
 
   void publishResults(const std_msgs::Header& header,
                       const cv::Mat& mask,
@@ -128,8 +179,14 @@ private:
   int s_min_, s_max_;
   int v_min_, v_max_;
   int morph_kernel_size_;
-  int min_contour_area_;
+  int min_contour_length_;
   int max_contour_points_;
+  double min_aspect_ratio_;
+  double max_aspect_ratio_;
+
+  bool enable_contour_merging_;
+  double merge_max_angle_diff_deg_;
+  double merge_max_region_gap_n_;
 
   double image_scale_;
   double target_angle_;

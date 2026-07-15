@@ -9,6 +9,61 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <numeric>
+#include <map>
+
+namespace
+{
+
+/**
+ * @brief Minimal disjoint-set (union-find) for contour merge grouping.
+ */
+class UnionFind
+{
+public:
+  explicit UnionFind(size_t n) : parent_(n)
+  {
+    std::iota(parent_.begin(), parent_.end(), 0);
+  }
+
+  size_t find(size_t x)
+  {
+    if (parent_[x] != x)
+    {
+      parent_[x] = find(parent_[x]);
+    }
+    return parent_[x];
+  }
+
+  void unite(size_t a, size_t b)
+  {
+    parent_[find(a)] = find(b);
+  }
+
+private:
+  std::vector<size_t> parent_;
+};
+
+/**
+ * @brief Normalize an angle difference to [0, pi/2] for line-direction comparison.
+ */
+double lineAngleDifference(double a, double b)
+{
+  double diff = std::abs(a - b);
+  if (diff > M_PI)
+  {
+    diff = 2.0 * M_PI - diff;
+  }
+  // Line direction is ambiguous by pi.
+  if (diff > M_PI / 2.0)
+  {
+    diff = M_PI - diff;
+  }
+  return diff;
+}
+
+}  // namespace
 
 namespace gemini_geometry_detector
 {
@@ -66,11 +121,6 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
                                   [this](const Eigen::Vector3f& normal, float d)
                                   {
                                     guide_line_estimator_->setGroundPlane(normal, d);
-                                    ROS_INFO_THROTTLE(5.0,
-                                                      "Ground plane set: "
-                                                      "n=(%.3f, %.3f, %.3f), d=%.3f",
-                                                      normal.x(), normal.y(),
-                                                      normal.z(), d);
                                   });
   }
 
@@ -106,8 +156,15 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
   ROS_INFO("  V: [%3d, %3d]", v_min_, v_max_);
   ROS_INFO("[Contour filtering]");
   ROS_INFO("  morph_kernel_size:  %d", morph_kernel_size_);
-  ROS_INFO("  min_contour_area:   %d", min_contour_area_);
+  ROS_INFO("  min_contour_length: %d", min_contour_length_);
   ROS_INFO("  max_contour_points: %d", max_contour_points_);
+  ROS_INFO("  aspect_ratio range: [%.2f, %s]",
+           min_aspect_ratio_,
+           max_aspect_ratio_ > 0.0 ? std::to_string(max_aspect_ratio_).c_str() : "inf");
+  ROS_INFO("[Contour merging]");
+  ROS_INFO("  enable:               %s", enable_contour_merging_ ? "true" : "false");
+  ROS_INFO("  max_angle_diff_deg:   %.2f", merge_max_angle_diff_deg_);
+  ROS_INFO("  max_region_gap_n:     %.3f", merge_max_region_gap_n_);
   ROS_INFO("============================================================");
 }
 
@@ -126,8 +183,14 @@ void ColorRegionDetector::loadParameters()
   pnh_.param("v_max", v_max_, 255);
 
   pnh_.param("morph_kernel_size", morph_kernel_size_, 5);
-  pnh_.param("min_contour_area", min_contour_area_, 200);
+  pnh_.param("min_contour_length", min_contour_length_, 50);
   pnh_.param("max_contour_points", max_contour_points_, 64);
+  pnh_.param("min_aspect_ratio", min_aspect_ratio_, 1.0);
+  pnh_.param("max_aspect_ratio", max_aspect_ratio_, 0.0);
+
+  pnh_.param("enable_contour_merging", enable_contour_merging_, false);
+  pnh_.param("merge_max_angle_diff_deg", merge_max_angle_diff_deg_, 15.0);
+  pnh_.param("merge_max_region_gap_n", merge_max_region_gap_n_, 0.1);
 
   pnh_.param("image_scale", image_scale_, 0.5);
   pnh_.param("use_tf_target_angle", use_tf_target_angle_, true);
@@ -163,6 +226,29 @@ void ColorRegionDetector::loadParameters()
   {
     ROS_WARN("look_ahead_m must be >= 0, reset to 0.0");
     look_ahead_m_ = 0.0;
+  }
+
+  if (min_aspect_ratio_ < 1.0)
+  {
+    ROS_WARN("min_aspect_ratio must be >= 1.0, reset to 1.0");
+    min_aspect_ratio_ = 1.0;
+  }
+  if (max_aspect_ratio_ > 0.0 && max_aspect_ratio_ < min_aspect_ratio_)
+  {
+    ROS_WARN("max_aspect_ratio (%.2f) < min_aspect_ratio (%.2f), disabling max filter",
+             max_aspect_ratio_, min_aspect_ratio_);
+    max_aspect_ratio_ = 0.0;
+  }
+
+  if (merge_max_angle_diff_deg_ < 0.0)
+  {
+    ROS_WARN("merge_max_angle_diff_deg must be >= 0, reset to 15.0");
+    merge_max_angle_diff_deg_ = 15.0;
+  }
+  if (merge_max_region_gap_n_ < 0.0)
+  {
+    ROS_WARN("merge_max_region_gap_n must be >= 0, reset to 0.1");
+    merge_max_region_gap_n_ = 0.1;
   }
 
   if (guide_line_estimator_type_ != "FitLineGuideLineEstimator" &&
@@ -260,35 +346,52 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
   std::vector<std::vector<cv::Point>> contours;
   detectContours(mask, contours);
 
+  const double scaled_min_length = static_cast<double>(min_contour_length_) *
+                                   image_scale_;
+
+  std::vector<std::vector<cv::Point>> all_contours = contours;
+  int merged_count = 0;
+  if (enable_contour_merging_)
+  {
+    std::vector<std::vector<cv::Point>> merged = mergeContours(contours, scaled_min_length);
+    merged_count = static_cast<int>(merged.size());
+    if (!merged.empty())
+    {
+      all_contours.insert(all_contours.end(),
+                          std::make_move_iterator(merged.begin()),
+                          std::make_move_iterator(merged.end()));
+    }
+  }
+
   cv::Mat annotated = proc_image->clone();
   ContourArray contour_array;
   contour_array.header = rgb_msg->header;
 
-  const double scaled_min_area = static_cast<double>(min_contour_area_) *
-                                 image_scale_ * image_scale_;
-
   int id = 0;
   int filtered_count = 0;
 
-  for (const auto& contour : contours)
+  for (size_t i = 0; i < all_contours.size(); ++i)
   {
+    const auto& contour = all_contours[i];
+    const bool is_merged = (i >= contours.size());
+
     ContourInfo info;
-    if (!buildContourInfo(contour, id, info, scaled_min_area))
+    if (!buildContourInfo(contour, id, info, scaled_min_length))
     {
       ++filtered_count;
       continue;
     }
 
-    drawContourOnImage(annotated, contour, info);
+    drawContourOnImage(annotated, contour, info, is_merged);
     contour_array.contours.push_back(info);
     ++id;
   }
 
-  const auto largest_contour = findLargestContour(contours, scaled_min_area);
+  const auto largest_contour = findLargestContour(all_contours, scaled_min_length);
   const auto rect_contour = getRectangularContour(largest_contour);
-  const double largest_area = largest_contour.empty()
-                                  ? 0.0
-                                  : cv::contourArea(largest_contour);
+  const double largest_length = largest_contour.empty()
+                                    ? 0.0
+                                    : cv::arcLength(largest_contour, true);
 
   GuideLineError error_msg;
   std::string invalid_reason;
@@ -314,9 +417,9 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
 
     ROS_WARN_THROTTLE(1.0,
                       "GuideLineError invalid: %s (raw contours: %zu, "
-                      "scaled_min_area: %.1f, image: %dx%d)",
-                      invalid_reason.c_str(), contours.size(), scaled_min_area,
-                      proc_image->cols, proc_image->rows);
+                      "merged contours: %d, scaled_min_length: %.1f, image: %dx%d)",
+                      invalid_reason.c_str(), contours.size(), merged_count,
+                      scaled_min_length, proc_image->cols, proc_image->rows);
   }
   else
   {
@@ -352,46 +455,47 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
     ROS_WARN_THROTTLE(1.0,
                       "[Frame %d] GuideLineError INVALID: reason=%s, "
                       "camera_info=%s, largest_contour=%s, "
-                      "raw contours=%zu, scaled_min_area=%.1f",
+                      "raw contours=%zu, merged contours=%d, scaled_min_length=%.1f",
                       frame_counter_,
                       invalid_reason.empty() ? "estimator" : invalid_reason.c_str(),
                       camera_info_received_ ? "yes" : "no",
                       largest_contour.empty() ? "empty" : "present",
-                      contours.size(),
-                      scaled_min_area);
+                      contours.size(), merged_count,
+                      scaled_min_length);
   }
 
-  ROS_INFO_THROTTLE(1.0,
+  ROS_DEBUG_THROTTLE(1.0,
                     "[Frame %d] Detection: image=%dx%d scale=%.2f, "
-                    "raw_contours=%zu, valid_2d=%zu, filtered=%d, largest_area=%.1f",
+                    "raw_contours=%zu, merged_contours=%d, valid_2d=%zu, "
+                    "filtered=%d, scaled_min_length=%.1f, largest_length=%.1f",
                     frame_counter_,
                     proc_image->cols, proc_image->rows, image_scale_,
-                    contours.size(), contour_array.contours.size(), filtered_count,
-                    largest_area);
+                    contours.size(), merged_count, contour_array.contours.size(),
+                    filtered_count, scaled_min_length, largest_length);
 
   publishResults(rgb_msg->header, mask, annotated, contour_array);
 }
 
 std::vector<cv::Point> ColorRegionDetector::findLargestContour(
     const std::vector<std::vector<cv::Point>>& contours,
-    double min_area) const
+    double min_contour_length) const
 {
   std::vector<cv::Point> largest;
-  double max_area = 0.0;
+  double max_length = 0.0;
   for (const auto& contour : contours)
   {
     if (contour.size() < 3)
     {
       continue;
     }
-    const double area = cv::contourArea(contour);
-    if (area < min_area || area <= 1e-6)
+    const double length = cv::arcLength(contour, true);
+    if (length < min_contour_length)
     {
       continue;
     }
-    if (area > max_area)
+    if (length > max_length)
     {
-      max_area = area;
+      max_length = length;
       largest = contour;
     }
   }
@@ -559,10 +663,10 @@ void ColorRegionDetector::detectContours(const cv::Mat& mask,
 bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour,
                                            int id,
                                            ContourInfo& info,
-                                           double min_contour_area)
+                                           double min_contour_length)
 {
-  double area = cv::contourArea(contour);
-  if (area < min_contour_area)
+  const double length = cv::arcLength(contour, true);
+  if (length < min_contour_length)
   {
     return false;
   }
@@ -576,6 +680,13 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
   }
 
   cv::Rect bbox = cv::boundingRect(contour);
+
+  if (!isAspectRatioValid(bbox, id))
+  {
+    return false;
+  }
+
+  const double area = cv::contourArea(contour);
 
   info.id = id;
   info.center.x = center.x;
@@ -612,9 +723,233 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
   return true;
 }
 
+bool ColorRegionDetector::isAspectRatioValid(const cv::Rect& bbox, int id) const
+{
+  if (bbox.width <= 0 || bbox.height <= 0)
+  {
+    return true;
+  }
+
+  const double aspect_ratio =
+      std::max(static_cast<double>(bbox.width),
+               static_cast<double>(bbox.height)) /
+      std::min(static_cast<double>(bbox.width),
+               static_cast<double>(bbox.height));
+
+  if (aspect_ratio < min_aspect_ratio_ ||
+      (max_aspect_ratio_ > 0.0 && aspect_ratio > max_aspect_ratio_))
+  {
+    ROS_WARN_THROTTLE(1.0,
+                      "Contour %d filtered by aspect ratio: %.2f "
+                      "(allowed [%.2f, %.2f])",
+                      id, aspect_ratio,
+                      min_aspect_ratio_,
+                      max_aspect_ratio_ > 0.0
+                          ? max_aspect_ratio_
+                          : std::numeric_limits<double>::infinity());
+    return false;
+  }
+
+  return true;
+}
+
+std::vector<NormalizedContourFeatures> ColorRegionDetector::computeContourFeatures(
+    const std::vector<std::vector<cv::Point>>& contours,
+    double min_contour_length) const
+{
+  const double fx = camera_intrinsics_.fx * image_scale_;
+  const double fy = camera_intrinsics_.fy * image_scale_;
+  const double cx = camera_intrinsics_.cx * image_scale_;
+  const double cy = camera_intrinsics_.cy * image_scale_;
+
+  std::vector<NormalizedContourFeatures> features;
+  features.reserve(contours.size());
+
+  for (size_t i = 0; i < contours.size(); ++i)
+  {
+    const auto& contour = contours[i];
+    NormalizedContourFeatures f;
+    f.bbox = cv::boundingRect(contour);
+
+    const double length = cv::arcLength(contour, true);
+    if (length < min_contour_length || !isAspectRatioValid(f.bbox, static_cast<int>(i)))
+    {
+      features.push_back(f);
+      continue;
+    }
+
+    cv::Moments m = cv::moments(contour);
+    cv::Point2f center(0.0f, 0.0f);
+    if (m.m00 > 0.0)
+    {
+      center.x = static_cast<float>(m.m10 / m.m00);
+      center.y = static_cast<float>(m.m01 / m.m00);
+    }
+
+    f.center_n.x = static_cast<float>((center.x - cx) / fx);
+    f.center_n.y = static_cast<float>((center.y - cy) / fy);
+
+    std::vector<cv::Point2f> normalized_points;
+    normalized_points.reserve(contour.size());
+    for (const auto& p : contour)
+    {
+      normalized_points.emplace_back(
+          static_cast<float>((p.x - cx) / fx),
+          static_cast<float>((p.y - cy) / fy));
+    }
+
+    if (normalized_points.size() >= 2)
+    {
+      cv::Mat line;
+      cv::fitLine(normalized_points, line, cv::DIST_L2, 0, 0.01, 0.01);
+      const float vx = line.at<float>(0, 0);
+      const float vy = line.at<float>(1, 0);
+      f.angle = std::atan2(vy, vx);
+    }
+
+    f.valid = true;
+    features.push_back(f);
+  }
+
+  return features;
+}
+
+std::vector<std::vector<cv::Point>> ColorRegionDetector::mergeContours(
+    const std::vector<std::vector<cv::Point>>& contours,
+    double min_contour_length) const
+{
+  std::vector<std::vector<cv::Point>> merged_contours;
+  if (!camera_intrinsics_.valid() || contours.size() < 2)
+  {
+    return merged_contours;
+  }
+
+  const auto features = computeContourFeatures(contours, min_contour_length);
+
+  std::vector<size_t> valid_indices;
+  valid_indices.reserve(contours.size());
+  for (size_t i = 0; i < features.size(); ++i)
+  {
+    if (features[i].valid)
+    {
+      valid_indices.push_back(i);
+    }
+  }
+
+  if (valid_indices.size() < 2)
+  {
+    return merged_contours;
+  }
+
+  const double angle_thresh_rad = merge_max_angle_diff_deg_ * M_PI / 180.0;
+
+  UnionFind uf(valid_indices.size());
+
+  for (size_t a = 0; a < valid_indices.size(); ++a)
+  {
+    const size_t idx_a = valid_indices[a];
+    const auto& fa = features[idx_a];
+
+    for (size_t b = a + 1; b < valid_indices.size(); ++b)
+    {
+      const size_t idx_b = valid_indices[b];
+      const auto& fb = features[idx_b];
+
+      const double angle_diff = lineAngleDifference(fa.angle, fb.angle);
+      if (angle_diff > angle_thresh_rad)
+      {
+        continue;
+      }
+
+      const double region_gap = computeNormalizedBboxGap(fa.bbox, fb.bbox);
+      if (region_gap > merge_max_region_gap_n_)
+      {
+        continue;
+      }
+
+      uf.unite(a, b);
+    }
+  }
+
+  // Group indices by root.
+  std::map<size_t, std::vector<size_t>> groups;
+  for (size_t a = 0; a < valid_indices.size(); ++a)
+  {
+    groups[uf.find(a)].push_back(valid_indices[a]);
+  }
+
+  for (const auto& kv : groups)
+  {
+    const auto& group = kv.second;
+    if (group.size() < 2)
+    {
+      continue;
+    }
+
+    std::vector<cv::Point> merged;
+    size_t total_points = 0;
+    for (size_t idx : group)
+    {
+      total_points += contours[idx].size();
+    }
+    merged.reserve(total_points);
+
+    for (size_t idx : group)
+    {
+      merged.insert(merged.end(), contours[idx].begin(), contours[idx].end());
+    }
+
+    merged_contours.push_back(std::move(merged));
+  }
+
+  return merged_contours;
+}
+
+double ColorRegionDetector::computeNormalizedBboxGap(const cv::Rect& a,
+                                                     const cv::Rect& b) const
+{
+  const double fx = camera_intrinsics_.fx * image_scale_;
+  const double fy = camera_intrinsics_.fy * image_scale_;
+  const double cx = camera_intrinsics_.cx * image_scale_;
+  const double cy = camera_intrinsics_.cy * image_scale_;
+
+  const double ax1 = (a.x - cx) / fx;
+  const double ax2 = (a.x + a.width - cx) / fx;
+  const double ay1 = (a.y - cy) / fy;
+  const double ay2 = (a.y + a.height - cy) / fy;
+
+  const double bx1 = (b.x - cx) / fx;
+  const double bx2 = (b.x + b.width - cx) / fx;
+  const double by1 = (b.y - cy) / fy;
+  const double by2 = (b.y + b.height - cy) / fy;
+
+  double gap_x = 0.0;
+  if (ax2 < bx1)
+  {
+    gap_x = bx1 - ax2;
+  }
+  else if (bx2 < ax1)
+  {
+    gap_x = ax1 - bx2;
+  }
+
+  double gap_y = 0.0;
+  if (ay2 < by1)
+  {
+    gap_y = by1 - ay2;
+  }
+  else if (by2 < ay1)
+  {
+    gap_y = ay1 - by2;
+  }
+
+  return std::sqrt(gap_x * gap_x + gap_y * gap_y);
+}
+
 void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
                                              const std::vector<cv::Point>& contour,
-                                             const ContourInfo& info)
+                                             const ContourInfo& info,
+                                             bool is_merged)
 {
   cv::Rect bbox(
       static_cast<int>(info.bbox_tl.x),
@@ -627,7 +962,11 @@ void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
   cv::circle(annotated,
              cv::Point(static_cast<int>(info.center.x), static_cast<int>(info.center.y)),
              4, cv::Scalar(0, 0, 255), -1);
-  cv::rectangle(annotated, bbox, cv::Scalar(255, 0, 0), 2);
+
+  // Use magenta for merged contours so they are visually distinct.
+  const cv::Scalar bbox_color = is_merged ? cv::Scalar(255, 0, 255)
+                                          : cv::Scalar(255, 0, 0);
+  cv::rectangle(annotated, bbox, bbox_color, 2);
 }
 
 void ColorRegionDetector::publishResults(const std_msgs::Header& header,
@@ -635,7 +974,7 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
                                          const cv::Mat& annotated,
                                          const ContourArray& contour_array)
 {
-  ROS_INFO_THROTTLE(1.0,
+  ROS_DEBUG_THROTTLE(1.0,
                     "Publishing: mask + annotated + %zu 2D contours",
                     contour_array.contours.size());
 

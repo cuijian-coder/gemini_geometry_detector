@@ -90,7 +90,7 @@ v_max: 255
 
 1. **形态学开/闭运算**：去除小噪点并填补目标区域内部空洞。
 2. **findContours**：只检测最外层轮廓（`RETR_EXTERNAL`）。
-3. **面积过滤**：剔除小于 `min_contour_area` 的轮廓。
+3. **长度过滤**：剔除周长小于 `min_contour_length` 的轮廓（使用周长而非面积，避免细长水平线被误过滤）。
 4. **几何计算**：通过图像矩计算轮廓中心，通过 `boundingRect` 计算包围盒。
 5. **下采样**：每个 2D 轮廓最多保留 `max_contour_points` 个点。
 
@@ -235,8 +235,10 @@ v_max: 255
 | `s_min` / `s_max` | `config/detector.yaml` | HSV 饱和度范围 |
 | `v_min` / `v_max` | `config/detector.yaml` | HSV 亮度范围 |
 | `morph_kernel_size` | `config/detector.yaml` | 形态学核大小 |
-| `min_contour_area` | `config/detector.yaml` | 轮廓最小面积阈值（原图分辨率） |
+| `min_contour_length` | `config/detector.yaml` | 轮廓最小周长阈值（原图分辨率，使用 `cv::arcLength`） |
 | `max_contour_points` | `config/detector.yaml` | 轮廓最大点数（拟合 + 发布） |
+| `min_aspect_ratio` | `config/detector.yaml` | 轮廓最小长宽比（长边/短边），用于过滤非线状区域 |
+| `max_aspect_ratio` | `config/detector.yaml` | 轮廓最大长宽比，`<=0` 表示不限制 |
 | `image_scale` | `config/detector.yaml` | 颜色检测和引导线的图像缩放比例 |
 | `use_tf_target_angle` | `config/detector.yaml` | 是否通过 TF 自动计算 `target_angle` |
 | `target_angle` | `config/detector.yaml` | 目标线方向（rad），TF 失败时作为回退；FitLine 为图像平面角，Depth 为地平面相对车体前向的角 |
@@ -347,11 +349,12 @@ rqt_image_view /gemini_geometry_detector/color/annotated
 - 环境同色噪声 → 提高 `s_min` 和 `v_min`
 - 目标发暗 → 降低 `v_min`
 
-### 8.2 形态学与面积
+### 8.2 形态学与长度
 
 - 掩码噪点多 → 增大 `morph_kernel_size`
-- 误检小区域 → 增大 `min_contour_area`
-- 远处目标漏检 → 减小 `min_contour_area`
+- 误检短线段 → 增大 `min_contour_length`
+- 远处目标漏检 → 减小 `min_contour_length`
+- 细长水平线被过滤 → 已改用 `cv::arcLength`，按实际长度调整即可
 
 ### 8.3 引导线方向
 

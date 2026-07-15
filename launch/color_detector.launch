@@ -11,6 +11,11 @@
   <arg name="ground_plane_provider_type" default=""/>
   <arg name="camera_height" default=""/>
 
+  <!-- Contour merging overrides. Empty means use config file value. -->
+  <arg name="enable_contour_merging" default=""/>
+  <arg name="merge_max_angle_diff_deg" default=""/>
+  <arg name="merge_max_region_gap_n" default=""/>
+
   <group ns="$(arg output_ns)">
     <node name="color_region_detector" pkg="gemini_geometry_detector" type="color_region_detector_node" output="screen">
       <param name="input_topic" value="$(arg input_topic)"/>
@@ -20,6 +25,12 @@
              name="ground_plane_provider_type" value="$(arg ground_plane_provider_type)"/>
       <param if="$(eval arg('camera_height') != '')"
              name="camera_height" value="$(arg camera_height)"/>
+      <param if="$(eval arg('enable_contour_merging') != '')"
+             name="enable_contour_merging" value="$(arg enable_contour_merging)"/>
+      <param if="$(eval arg('merge_max_angle_diff_deg') != '')"
+             name="merge_max_angle_diff_deg" value="$(arg merge_max_angle_diff_deg)"/>
+      <param if="$(eval arg('merge_max_region_gap_n') != '')"
+             name="merge_max_region_gap_n" value="$(arg merge_max_region_gap_n)"/>
     </node>
   </group>
 </launch>
