@@ -45,6 +45,18 @@ void DepthGuideLineEstimator::setGroundPlane(const Eigen::Vector3f& normal, floa
     ground_normal_.normalize();
   }
   ground_d_ = d;
+
+  // Ensure a consistent sign convention: the camera origin should be on the
+  // side pointed to by the ground normal (i.e. d > 0).  If d < 0, the normal
+  // currently points toward the ground rather than away from it; flipping both
+  // n and d keeps the same geometric plane but makes the ray-plane intersection
+  // t = -d / (n . ray) positive for rays heading toward the ground.
+  if (ground_d_ < 0.0f)
+  {
+    ground_normal_ = -ground_normal_;
+    ground_d_ = -ground_d_;
+  }
+
   ground_plane_received_ = true;
 
   static bool first = true;
@@ -101,10 +113,20 @@ GuideLineError DepthGuideLineEstimator::estimate(const std::vector<cv::Point>& l
                 true, cv::Scalar(255, 0, 0), 2);
 
   // Back-project contour pixels to ground-plane points.
+  // For a stationary camera, using all points gives a much more stable line
+  // fit than the previous fixed-size uniform sampling.  We only subsample when
+  // the contour is larger than max_contour_points_, and in that case use a
+  // fixed step so the selected point set is deterministic.
   std::vector<Eigen::Vector3f> ground_points;
-  ground_points.reserve(std::min(max_contour_points_, static_cast<int>(largest_contour.size())));
+  ground_points.reserve(std::min(max_contour_points_,
+                                 static_cast<int>(largest_contour.size())));
 
-  const int step = std::max(1, static_cast<int>(largest_contour.size()) / max_contour_points_);
+  const size_t contour_size = largest_contour.size();
+  const size_t step = contour_size <= static_cast<size_t>(max_contour_points_)
+                          ? 1
+                          : (contour_size + max_contour_points_ - 1) /
+                                static_cast<size_t>(max_contour_points_);
+
   int skipped_rays = 0;
   int skipped_intersections = 0;
   for (size_t i = 0; i < largest_contour.size(); i += step)
@@ -131,9 +153,13 @@ GuideLineError DepthGuideLineEstimator::estimate(const std::vector<cv::Point>& l
     ROS_WARN_THROTTLE(1.0,
                       "[DepthGuideLineEstimator] not enough ground-plane points: "
                       "%zu valid (contour_pts=%zu, skipped_rays=%d, "
-                      "skipped_intersections=%d)",
+                      "skipped_intersections=%d). "
+                      "Ground plane: n=(%.3f, %.3f, %.3f), d=%.3f. "
+                      "Check ground-plane sign convention / frame_id.",
                       ground_points.size(), largest_contour.size(),
-                      skipped_rays, skipped_intersections);
+                      skipped_rays, skipped_intersections,
+                      ground_normal_.x(), ground_normal_.y(),
+                      ground_normal_.z(), ground_d_);
     return error_msg;
   }
 

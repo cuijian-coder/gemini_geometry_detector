@@ -398,4 +398,5 @@ rqt_image_view /gemini_geometry_detector/color/annotated
 | `rviz/color_detector.rviz` | RViz 配置文件 |
 | `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
 | `msg/GuideLineError.msg` | 引导线误差消息 |
-| `docs/color_region_detector.md` | 详细算法说明文档 |
+| `docs/color_region_detector.md` | 上游轮廓检测、过滤与合并说明 |
+| `docs/depth_guide_line_estimator.md` | DepthGuideLineEstimator 反投影与误差计算说明 |

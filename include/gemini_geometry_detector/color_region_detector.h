@@ -76,9 +76,6 @@ private:
   void processFrame(const sensor_msgs::ImageConstPtr& rgb_msg,
                     const cv::Mat& bgr_image);
 
-  std::vector<cv::Point> findLargestContour(const std::vector<std::vector<cv::Point>>& contours,
-                                            double min_contour_length) const;
-
   /**
    * @brief Compute a minimum-area rotated rectangle from a contour.
    *
@@ -124,14 +121,16 @@ private:
       double min_contour_length) const;
 
   /**
-   * @brief Merge contours that belong to the same physical guide line.
+   * @brief Group valid contours into merge groups and sort them from bottom to
+   *        top of the image.
    *
-   * The returned vector contains new contours that are the concatenation of
-   * original contour points. Original contours are NOT modified.
+   * When contour merging is enabled, contours are grouped with union-find based
+   * on direction and normalized bounding-box gap.  Each group is a candidate
+   * guide line, ordered so that the nearest (bottom-most) group is tried first.
    */
-  std::vector<std::vector<cv::Point>> mergeContours(
-      const std::vector<std::vector<cv::Point>>& contours,
-      double min_contour_length) const;
+  std::vector<std::vector<size_t>> findBottomUpMergeGroups(
+      const std::vector<NormalizedContourFeatures>& features,
+      const std::vector<size_t>& valid_indices) const;
 
   /**
    * @brief Compute the nearest distance between two axis-aligned bounding boxes

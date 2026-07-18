@@ -349,89 +349,182 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
   const double scaled_min_length = static_cast<double>(min_contour_length_) *
                                    image_scale_;
 
-  std::vector<std::vector<cv::Point>> all_contours = contours;
-  int merged_count = 0;
-  if (enable_contour_merging_)
+  // 1. Compute normalized features for all raw contours.
+  const auto features = computeContourFeatures(contours, scaled_min_length);
+
+  // 2. Collect valid contour indices.
+  std::vector<size_t> valid_indices;
+  valid_indices.reserve(features.size());
+  for (size_t i = 0; i < features.size(); ++i)
   {
-    std::vector<std::vector<cv::Point>> merged = mergeContours(contours, scaled_min_length);
-    merged_count = static_cast<int>(merged.size());
-    if (!merged.empty())
+    if (features[i].valid)
     {
-      all_contours.insert(all_contours.end(),
-                          std::make_move_iterator(merged.begin()),
-                          std::make_move_iterator(merged.end()));
+      valid_indices.push_back(i);
     }
   }
 
+  // 3. Build merge groups sorted from bottom to top of the image.
+  //    Each group is a candidate guide line; the bottom-most group is the nearest
+  //    one to the camera and is tried first.
+  const auto groups = findBottomUpMergeGroups(features, valid_indices);
+
+  // 4. Draw all raw contours and build the 2D contour array.
   cv::Mat annotated = proc_image->clone();
   ContourArray contour_array;
   contour_array.header = rgb_msg->header;
 
   int id = 0;
   int filtered_count = 0;
-
-  for (size_t i = 0; i < all_contours.size(); ++i)
+  for (size_t i = 0; i < contours.size(); ++i)
   {
-    const auto& contour = all_contours[i];
-    const bool is_merged = (i >= contours.size());
-
     ContourInfo info;
-    if (!buildContourInfo(contour, id, info, scaled_min_length))
+    if (!buildContourInfo(contours[i], id, info, scaled_min_length))
     {
       ++filtered_count;
       continue;
     }
 
-    drawContourOnImage(annotated, contour, info, is_merged);
+    drawContourOnImage(annotated, contours[i], info, false);
     contour_array.contours.push_back(info);
     ++id;
   }
 
-  const auto largest_contour = findLargestContour(all_contours, scaled_min_length);
-  const auto rect_contour = getRectangularContour(largest_contour);
-  const double largest_length = largest_contour.empty()
-                                    ? 0.0
-                                    : cv::arcLength(largest_contour, true);
+  double largest_length = 0.0;
+  for (size_t idx : valid_indices)
+  {
+    const double length = cv::arcLength(contours[idx], true);
+    if (length > largest_length)
+    {
+      largest_length = length;
+    }
+  }
 
+  // 5. Try each group from bottom up until the estimator returns a valid result.
   GuideLineError error_msg;
+  error_msg.header = rgb_msg->header;
+  error_msg.valid = false;
+  error_msg.yaw_error = 0.0;
+  error_msg.lateral_error_n = 0.0;
+  error_msg.lateral_error_m = 0.0;
+  error_msg.roi_point.x = 0.0;
+  error_msg.roi_point.y = 0.0;
+  error_msg.roi_point.z = 0.0;
+
   std::string invalid_reason;
+  int selected_group_idx = -1;
   if (!camera_intrinsics_.valid())
   {
     invalid_reason = "no valid camera_info";
   }
-  else if (largest_contour.empty())
+  else if (groups.empty())
   {
     invalid_reason = "no valid contour";
   }
-
-  if (!invalid_reason.empty())
-  {
-    error_msg.header = rgb_msg->header;
-    error_msg.valid = false;
-    error_msg.yaw_error = 0.0;
-    error_msg.lateral_error_n = 0.0;
-    error_msg.lateral_error_m = 0.0;
-    error_msg.roi_point.x = 0.0;
-    error_msg.roi_point.y = 0.0;
-    error_msg.roi_point.z = 0.0;
-
-    ROS_WARN_THROTTLE(1.0,
-                      "GuideLineError invalid: %s (raw contours: %zu, "
-                      "merged contours: %d, scaled_min_length: %.1f, image: %dx%d)",
-                      invalid_reason.c_str(), contours.size(), merged_count,
-                      scaled_min_length, proc_image->cols, proc_image->rows);
-  }
   else
   {
-    error_msg = guide_line_estimator_->estimate(largest_contour, rect_contour,
-                                                proc_image->size(), rgb_msg->header,
-                                                annotated);
+    // Sort candidate groups so that the most reliable one is tried first.
+    // We prioritize groups whose lowest point is in the bottom half of the
+    // image (near the robot), and among those we pick the longest one.  If no
+    // bottom group succeeds, we fall back to upper groups sorted by bottom-y.
+    const double bottom_threshold = proc_image->rows * 0.5;
+
+    struct GroupScore
+    {
+      size_t index;
+      double length;
+      double bottom_y;
+    };
+
+    std::vector<GroupScore> scores;
+    scores.reserve(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g)
+    {
+      double length = 0.0;
+      double bottom_y = 0.0;
+      for (size_t idx : groups[g])
+      {
+        length += cv::arcLength(contours[idx], true);
+        const double b = features[idx].bbox.y + features[idx].bbox.height;
+        if (b > bottom_y)
+        {
+          bottom_y = b;
+        }
+      }
+      scores.push_back({ g, length, bottom_y });
+    }
+
+    std::sort(scores.begin(), scores.end(),
+              [&](const GroupScore& a, const GroupScore& b)
+              {
+                const bool a_bottom = a.bottom_y >= bottom_threshold;
+                const bool b_bottom = b.bottom_y >= bottom_threshold;
+                if (a_bottom && b_bottom)
+                {
+                  return a.length > b.length;
+                }
+                if (a_bottom && !b_bottom)
+                {
+                  return true;
+                }
+                if (!a_bottom && b_bottom)
+                {
+                  return false;
+                }
+                return a.bottom_y > b.bottom_y;
+              });
+
+    for (size_t rank = 0; rank < scores.size(); ++rank)
+    {
+      const size_t g = scores[rank].index;
+      const auto& group = groups[g];
+
+      std::vector<cv::Point> merged;
+      size_t total_points = 0;
+      for (size_t idx : group)
+      {
+        total_points += contours[idx].size();
+      }
+      merged.reserve(total_points);
+      for (size_t idx : group)
+      {
+        merged.insert(merged.end(), contours[idx].begin(), contours[idx].end());
+      }
+
+      const auto rect_contour = getRectangularContour(merged);
+
+      // Use a temporary annotated image for candidate groups so that failed
+      // groups do not clutter the final visualization.
+      cv::Mat temp_annotated = annotated.clone();
+      GuideLineError candidate = guide_line_estimator_->estimate(
+          merged, rect_contour,
+          proc_image->size(), rgb_msg->header, temp_annotated);
+
+      if (candidate.valid)
+      {
+        error_msg = candidate;
+        selected_group_idx = static_cast<int>(rank);
+        annotated = std::move(temp_annotated);
+        break;
+      }
+    }
+
     if (!error_msg.valid)
     {
+      invalid_reason = "estimator";
       ROS_WARN_THROTTLE(1.0,
-                        "GuideLineError invalid: estimator returned invalid result "
-                        "(see estimator logs for details)");
+                        "GuideLineError invalid: no group produced valid result "
+                        "(groups=%zu, see estimator logs)",
+                        groups.size());
     }
+  }
+
+  if (!invalid_reason.empty() && selected_group_idx < 0)
+  {
+    ROS_WARN_THROTTLE(1.0,
+                      "GuideLineError invalid: %s (raw contours: %zu, "
+                      "groups: %zu, scaled_min_length: %.1f, image: %dx%d)",
+                      invalid_reason.c_str(), contours.size(), groups.size(),
+                      scaled_min_length, proc_image->cols, proc_image->rows);
   }
 
   guide_line_error_pub_.publish(error_msg);
@@ -441,65 +534,42 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
     ROS_INFO_THROTTLE(1.0,
                       "[Frame %d] GuideLineError OK: "
                       "yaw=%.4f rad (%.1f deg), lat_n=%.4f, lat_m=%.4f, "
-                      "roi=(%.1f, %.1f)",
+                      "roi=(%.1f, %.1f), selected_group=%d/%zu (members=%zu)",
                       frame_counter_,
                       error_msg.yaw_error,
                       error_msg.yaw_error * 180.0 / M_PI,
                       error_msg.lateral_error_n,
                       error_msg.lateral_error_m,
                       error_msg.roi_point.x,
-                      error_msg.roi_point.y);
+                      error_msg.roi_point.y,
+                      selected_group_idx + 1,
+                      groups.size(),
+                      groups[selected_group_idx].size());
   }
   else
   {
     ROS_WARN_THROTTLE(1.0,
                       "[Frame %d] GuideLineError INVALID: reason=%s, "
-                      "camera_info=%s, largest_contour=%s, "
-                      "raw contours=%zu, merged contours=%d, scaled_min_length=%.1f",
+                      "camera_info=%s, groups=%zu, "
+                      "raw contours=%zu, scaled_min_length=%.1f",
                       frame_counter_,
-                      invalid_reason.empty() ? "estimator" : invalid_reason.c_str(),
+                      invalid_reason.c_str(),
                       camera_info_received_ ? "yes" : "no",
-                      largest_contour.empty() ? "empty" : "present",
-                      contours.size(), merged_count,
+                      groups.size(),
+                      contours.size(),
                       scaled_min_length);
   }
 
   ROS_DEBUG_THROTTLE(1.0,
                     "[Frame %d] Detection: image=%dx%d scale=%.2f, "
-                    "raw_contours=%zu, merged_contours=%d, valid_2d=%zu, "
+                    "raw_contours=%zu, groups=%zu, valid_2d=%zu, "
                     "filtered=%d, scaled_min_length=%.1f, largest_length=%.1f",
                     frame_counter_,
                     proc_image->cols, proc_image->rows, image_scale_,
-                    contours.size(), merged_count, contour_array.contours.size(),
+                    contours.size(), groups.size(), contour_array.contours.size(),
                     filtered_count, scaled_min_length, largest_length);
 
   publishResults(rgb_msg->header, mask, annotated, contour_array);
-}
-
-std::vector<cv::Point> ColorRegionDetector::findLargestContour(
-    const std::vector<std::vector<cv::Point>>& contours,
-    double min_contour_length) const
-{
-  std::vector<cv::Point> largest;
-  double max_length = 0.0;
-  for (const auto& contour : contours)
-  {
-    if (contour.size() < 3)
-    {
-      continue;
-    }
-    const double length = cv::arcLength(contour, true);
-    if (length < min_contour_length)
-    {
-      continue;
-    }
-    if (length > max_length)
-    {
-      max_length = length;
-      largest = contour;
-    }
-  }
-  return largest;
 }
 
 std::vector<cv::Point> ColorRegionDetector::getRectangularContour(
@@ -814,95 +884,94 @@ std::vector<NormalizedContourFeatures> ColorRegionDetector::computeContourFeatur
   return features;
 }
 
-std::vector<std::vector<cv::Point>> ColorRegionDetector::mergeContours(
-    const std::vector<std::vector<cv::Point>>& contours,
-    double min_contour_length) const
+std::vector<std::vector<size_t>> ColorRegionDetector::findBottomUpMergeGroups(
+    const std::vector<NormalizedContourFeatures>& features,
+    const std::vector<size_t>& valid_indices) const
 {
-  std::vector<std::vector<cv::Point>> merged_contours;
-  if (!camera_intrinsics_.valid() || contours.size() < 2)
+  std::vector<std::vector<size_t>> groups;
+  if (valid_indices.empty())
   {
-    return merged_contours;
+    return groups;
   }
 
-  const auto features = computeContourFeatures(contours, min_contour_length);
-
-  std::vector<size_t> valid_indices;
-  valid_indices.reserve(contours.size());
-  for (size_t i = 0; i < features.size(); ++i)
+  if (enable_contour_merging_ && valid_indices.size() >= 2 &&
+      camera_intrinsics_.valid())
   {
-    if (features[i].valid)
+    const double angle_thresh_rad = merge_max_angle_diff_deg_ * M_PI / 180.0;
+
+    UnionFind uf(valid_indices.size());
+
+    for (size_t a = 0; a < valid_indices.size(); ++a)
     {
-      valid_indices.push_back(i);
-    }
-  }
+      const size_t idx_a = valid_indices[a];
+      const auto& fa = features[idx_a];
 
-  if (valid_indices.size() < 2)
-  {
-    return merged_contours;
-  }
-
-  const double angle_thresh_rad = merge_max_angle_diff_deg_ * M_PI / 180.0;
-
-  UnionFind uf(valid_indices.size());
-
-  for (size_t a = 0; a < valid_indices.size(); ++a)
-  {
-    const size_t idx_a = valid_indices[a];
-    const auto& fa = features[idx_a];
-
-    for (size_t b = a + 1; b < valid_indices.size(); ++b)
-    {
-      const size_t idx_b = valid_indices[b];
-      const auto& fb = features[idx_b];
-
-      const double angle_diff = lineAngleDifference(fa.angle, fb.angle);
-      if (angle_diff > angle_thresh_rad)
+      for (size_t b = a + 1; b < valid_indices.size(); ++b)
       {
-        continue;
+        const size_t idx_b = valid_indices[b];
+        const auto& fb = features[idx_b];
+
+        const double angle_diff = lineAngleDifference(fa.angle, fb.angle);
+        if (angle_diff > angle_thresh_rad)
+        {
+          continue;
+        }
+
+        const double region_gap = computeNormalizedBboxGap(fa.bbox, fb.bbox);
+        if (region_gap > merge_max_region_gap_n_)
+        {
+          continue;
+        }
+
+        uf.unite(a, b);
       }
+    }
 
-      const double region_gap = computeNormalizedBboxGap(fa.bbox, fb.bbox);
-      if (region_gap > merge_max_region_gap_n_)
-      {
-        continue;
-      }
+    std::map<size_t, std::vector<size_t>> groups_map;
+    for (size_t a = 0; a < valid_indices.size(); ++a)
+    {
+      groups_map[uf.find(a)].push_back(valid_indices[a]);
+    }
 
-      uf.unite(a, b);
+    groups.reserve(groups_map.size());
+    for (auto& kv : groups_map)
+    {
+      groups.push_back(std::move(kv.second));
     }
   }
-
-  // Group indices by root.
-  std::map<size_t, std::vector<size_t>> groups;
-  for (size_t a = 0; a < valid_indices.size(); ++a)
+  else
   {
-    groups[uf.find(a)].push_back(valid_indices[a]);
+    // Merging disabled: each valid contour is its own group.
+    groups.reserve(valid_indices.size());
+    for (size_t idx : valid_indices)
+    {
+      groups.push_back({ idx });
+    }
   }
 
-  for (const auto& kv : groups)
-  {
-    const auto& group = kv.second;
-    if (group.size() < 2)
-    {
-      continue;
-    }
+  // Sort groups by the bottom of their lowest bounding box (descending),
+  // so the nearest group to the camera is tried first.
+  std::sort(groups.begin(), groups.end(),
+            [&](const std::vector<size_t>& a, const std::vector<size_t>& b)
+            {
+              auto max_bottom = [&](const std::vector<size_t>& group)
+              {
+                double bottom = 0.0;
+                for (size_t idx : group)
+                {
+                  const double group_bottom =
+                      features[idx].bbox.y + features[idx].bbox.height;
+                  if (group_bottom > bottom)
+                  {
+                    bottom = group_bottom;
+                  }
+                }
+                return bottom;
+              };
+              return max_bottom(a) > max_bottom(b);
+            });
 
-    std::vector<cv::Point> merged;
-    size_t total_points = 0;
-    for (size_t idx : group)
-    {
-      total_points += contours[idx].size();
-    }
-    merged.reserve(total_points);
-
-    for (size_t idx : group)
-    {
-      merged.insert(merged.end(), contours[idx].begin(), contours[idx].end());
-    }
-
-    merged_contours.push_back(std::move(merged));
-  }
-
-  return merged_contours;
+  return groups;
 }
 
 double ColorRegionDetector::computeNormalizedBboxGap(const cv::Rect& a,

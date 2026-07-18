@@ -24,9 +24,10 @@
     │  ├─ HSV 阈值分割 → 二值掩码
     │  ├─ 形态学开/闭运算去噪
     │  ├─ findContours 提取外轮廓
-    │  ├─ 面积过滤 + 计算 2D 中心/包围盒
+    │  ├─ 长度过滤 + 长宽比过滤 + 计算 2D 中心/包围盒
+    │  ├─ 自下而上对轮廓分组（最近优先）
     │  ├─ TF 自动计算 target_angle（启动一次）
-    │  ├─ 调用 IGuideLineEstimator::estimate()
+    │  ├─ 依次调用 IGuideLineEstimator::estimate()，直到成功
     │  │    ├─ FitLine: 归一化图像平面 + cv::fitLine
     │  │    └─ Depth: 反投影 + 地平面 PCA 直线
     │  ├─ 计算 yaw_error / lateral_error_n / lateral_error_m
@@ -266,37 +267,39 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 | `bbox_br` | `geometry_msgs/Point` | 包围盒右下角 `(u, v, 0)` |
 | `points` | `geometry_msgs/Point32[]` | 下采样后的轮廓点序列 |
 
-### 6.3 轮廓合并（可选）
+### 6.3 自下而上的锚点合并
 
-源码：`src/color_region_detector.cpp` → `mergeContours()` / `computeContourFeatures()`
+源码：`src/color_region_detector.cpp` → `findBottomUpMergeGroups()` / `computeContourFeatures()`
 
-**启用条件**：`enable_contour_merging: true`，且已收到有效的 `CameraInfo`。
+**启用条件**：`enable_contour_merging: true` 时合并同组轮廓；`false` 时每个有效轮廓自成一组。合并需要有效的 `CameraInfo`。
 
 **逻辑说明**：
-1. 对**已通过面积和长宽比过滤**的轮廓，分别计算：
+1. 对**已通过长度和长宽比过滤**的轮廓，分别计算：
    - 归一化图像平面中心 `center_n`。
    - 归一化图像平面方向角 `angle`，由 `cv::fitLine` 在归一化坐标上拟合得到。
    - 轴对齐包围盒 `bbox`（缩放后的像素坐标）。
-2. 对每对有效轮廓判断是否满足合并条件：
+2. 若合并启用，对每对有效轮廓判断是否满足合并条件：
    - 方向角差异 `angle_diff < merge_max_angle_diff_deg`（默认 15°）。
    - 包围盒最近距离 `region_gap < merge_max_region_gap_n`（默认 0.1，约 60 像素@fx≈613）。该距离通过 `computeNormalizedBboxGap()` 在归一化图像平面上计算：先分别求两个 bbox 在 x/y 方向上的间隙，再取欧氏距离；若 bbox 有重叠则间隙为 0。
-3. 使用并查集把满足条件的轮廓归为一组。
-4. 对包含多个轮廓的组，把原始像素点拼接成一个新轮廓。
-5. 新轮廓**追加**到原始轮廓列表末尾，后续一起经过 `buildContourInfo`、绘制、发布和最大轮廓选取。
+3. 使用并查集把满足条件的轮廓归为一组（传递合并）。
+4. 所有组合按**包围盒底部 y 坐标从大到小排序**，即**从图像底部向顶部排列**。底部组代表离摄像头最近的引导线，会被优先处理。
+5. 后续 `DepthGuideLineEstimator` 按此顺序依次尝试每个组：把组内轮廓像素拼接后反投影到地面，第一个能成功拟合地面的组即被采用。
 
-> 注意：合并后的轮廓是“新增”而不是“替换”，因此 `ContourArray` 中会同时看到原始轮廓和合并后的轮廓。
+> 注意：`ContourArray` 仍只发布原始轮廓；最终选中的组合仅通过 `GuideLineError` 和 `annotated` 图中的高亮体现。
 
 ---
 
 ## 7. 引导线拟合与误差计算
 
-### 7.1 选取最大轮廓
+### 7.1 选取候选组
 
-源码：`src/color_region_detector.cpp` → `findLargestContour()`
+源码：`src/color_region_detector.cpp` → `processFrame()`
 
 **逻辑说明**：
-- 遍历所有外轮廓，按面积排序，返回面积最大且满足最小面积阈值的轮廓。
-- 控制计算只基于该最大轮廓，减少多目标干扰。
+- 不再简单选取“最长”轮廓，而是优先处理**图像底部最近的合并组**。
+- 对每组调用 `IGuideLineEstimator::estimate()`，直到某组返回有效结果。
+- 若所有组都失败，最终输出 `GuideLineError invalid`。
+- 该策略能自动避开地平线、墙面等远处的长条状误检，优先使用离机器人最近的地面引导线。
 
 ### 7.2 矩形近似（仅可视化）
 
@@ -597,6 +600,7 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `rviz/color_detector.rviz` | RViz 配置文件 |
 | `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
 | `msg/GuideLineError.msg` | 引导线误差消息 |
+| `docs/depth_guide_line_estimator.md` | DepthGuideLineEstimator 反投影与误差计算详细说明 |
 
 ---
 

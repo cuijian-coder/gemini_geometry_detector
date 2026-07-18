@@ -17,7 +17,7 @@ morph_kernel_size: 7
 # Minimum contour length (arc length) in pixels to be considered valid.
 # A thin horizontal line has a very small area but can still be long, so using
 # arc length instead of area avoids filtering it out.
-min_contour_length: 50
+min_contour_length: 40
 
 # Maximum number of contour points to use for line fitting and publishing
 # (0 = all, downsample if >0)

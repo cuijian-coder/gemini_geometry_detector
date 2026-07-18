@@ -62,7 +62,7 @@ private:
   float ground_d_ = 0.0f;
   bool ground_plane_received_ = false;
 
-  int max_contour_points_ = 64;
+  int max_contour_points_ = 2048;
 };
 
 }  // namespace gemini_geometry_detector
