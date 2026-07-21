@@ -61,6 +61,7 @@ add_executable(color_region_detector_node
   src/color_region_detector.cpp
   src/fit_line_guide_line_estimator.cpp
   src/depth_guide_line_estimator.cpp
+  src/rectangle_guide_line_estimator.cpp
   src/topic_ground_plane_provider.cpp
   src/imu_ground_plane_provider.cpp
 )

@@ -12,6 +12,7 @@
 #include <tf2/transform_datatypes.h>
 
 #include <Eigen/Dense>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -145,6 +146,17 @@ private:
                           const ContourInfo& info,
                           bool is_merged = false);
 
+  /**
+   * @brief Update sliding-window statistics from a valid GuideLineError.
+   */
+  void updateErrorStats(const GuideLineError& error);
+
+  /**
+   * @brief Draw statistics text overlay on the annotated image.
+   */
+  void drawErrorStatsOverlay(cv::Mat& annotated,
+                             const GuideLineError& error) const;
+
   void publishResults(const std_msgs::Header& header,
                       const cv::Mat& mask,
                       const cv::Mat& annotated,
@@ -187,11 +199,24 @@ private:
   double merge_max_angle_diff_deg_;
   double merge_max_region_gap_n_;
 
+  double mask_filter_alpha_;
+
+  bool enable_error_stats_;
+  int error_stats_window_;
+
   double image_scale_;
   double target_angle_;
   double roi_y_ratio_;
   int roi_y_;  // Absolute pixel row; < 0 means use roi_y_ratio_.
+  double roi_bottom_ratio_;
   double look_ahead_m_;
+
+  // OBB estimator parameters (only used when guide_line_estimator_type_
+  // is "RectangleGuideLineEstimator").
+  double guide_line_width_m_;
+  double obb_width_tolerance_m_;
+  double obb_max_outlier_ratio_;
+  int obb_min_ground_points_;
 
   std::string guide_line_estimator_type_;
   std::string ground_plane_provider_type_;
@@ -203,6 +228,12 @@ private:
   bool camera_info_received_;
 
   CameraIntrinsics camera_intrinsics_;
+
+  cv::Mat mask_accumulator_;  ///< Float accumulator for temporal mask smoothing.
+
+  // Sliding-window buffers for error statistics (only valid frames are stored).
+  std::deque<double> yaw_error_history_;
+  std::deque<double> lateral_error_history_;
 };
 
 }  // namespace gemini_geometry_detector

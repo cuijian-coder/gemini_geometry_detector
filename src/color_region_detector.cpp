@@ -2,6 +2,7 @@
 
 #include "gemini_geometry_detector/fit_line_guide_line_estimator.h"
 #include "gemini_geometry_detector/depth_guide_line_estimator.h"
+#include "gemini_geometry_detector/rectangle_guide_line_estimator.h"
 #include "gemini_geometry_detector/topic_ground_plane_provider.h"
 #include "gemini_geometry_detector/imu_ground_plane_provider.h"
 
@@ -84,13 +85,24 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
     guide_line_estimator_.reset(new FitLineGuideLineEstimator());
     ROS_INFO("Using FitLineGuideLineEstimator (RGB-only image-plane fitting).");
   }
+  else if (guide_line_estimator_type_ == "RectangleGuideLineEstimator")
+  {
+    auto* rect_estimator = new RectangleGuideLineEstimator();
+    rect_estimator->setObbParameters(guide_line_width_m_,
+                                     obb_width_tolerance_m_,
+                                     obb_max_outlier_ratio_,
+                                     obb_min_ground_points_);
+    guide_line_estimator_.reset(rect_estimator);
+    ROS_INFO("Using RectangleGuideLineEstimator (ground-plane OBB fitting).");
+  }
   else
   {
     guide_line_estimator_.reset(new DepthGuideLineEstimator());
     ROS_INFO("Using DepthGuideLineEstimator (ground-plane 3D fitting).");
   }
 
-  if (guide_line_estimator_type_ == "DepthGuideLineEstimator")
+  if (guide_line_estimator_type_ == "DepthGuideLineEstimator" ||
+      guide_line_estimator_type_ == "RectangleGuideLineEstimator")
   {
     if (ground_plane_provider_type_ == "imu")
     {
@@ -139,9 +151,17 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
   ROS_INFO("  type:         %s", guide_line_estimator_type_.c_str());
   ROS_INFO("  target_angle: %.4f rad (%.1f deg)",
            target_angle_, target_angle_ * 180.0 / M_PI);
-  if (guide_line_estimator_type_ == "DepthGuideLineEstimator")
+  if (guide_line_estimator_type_ == "DepthGuideLineEstimator" ||
+      guide_line_estimator_type_ == "RectangleGuideLineEstimator")
   {
     ROS_INFO("  look_ahead_m: %.3f m", look_ahead_m_);
+    if (guide_line_estimator_type_ == "RectangleGuideLineEstimator")
+    {
+      ROS_INFO("  guide_line_width_m: %.3f m", guide_line_width_m_);
+      ROS_INFO("  obb_width_tolerance_m: %.3f m", obb_width_tolerance_m_);
+      ROS_INFO("  obb_max_outlier_ratio: %.2f", obb_max_outlier_ratio_);
+      ROS_INFO("  obb_min_ground_points: %d", obb_min_ground_points_);
+    }
     ROS_INFO("[Ground-plane provider]");
     ROS_INFO("  type: %s", ground_plane_provider_type_.c_str());
   }
@@ -150,6 +170,7 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
   ROS_INFO("  roi_y_ratio:        %.2f", roi_y_ratio_);
   ROS_INFO("  roi_y:              %d (%s)", roi_y_,
            roi_y_ < 0 ? "use roi_y_ratio" : "absolute pixels");
+  ROS_INFO("  roi_bottom_ratio:   %.2f", roi_bottom_ratio_);
   ROS_INFO("[Color segmentation (HSV)]");
   ROS_INFO("  H: [%3d, %3d]", h_min_, h_max_);
   ROS_INFO("  S: [%3d, %3d]", s_min_, s_max_);
@@ -165,6 +186,12 @@ ColorRegionDetector::ColorRegionDetector(ros::NodeHandle& nh, ros::NodeHandle& p
   ROS_INFO("  enable:               %s", enable_contour_merging_ ? "true" : "false");
   ROS_INFO("  max_angle_diff_deg:   %.2f", merge_max_angle_diff_deg_);
   ROS_INFO("  max_region_gap_n:     %.3f", merge_max_region_gap_n_);
+  ROS_INFO("[Mask temporal filtering]");
+  ROS_INFO("  mask_filter_alpha:    %.3f (%s)", mask_filter_alpha_,
+           mask_filter_alpha_ > 0.0 ? "enabled" : "disabled");
+  ROS_INFO("[Error statistics overlay]");
+  ROS_INFO("  enable:               %s", enable_error_stats_ ? "true" : "false");
+  ROS_INFO("  window:               %d", error_stats_window_);
   ROS_INFO("============================================================");
 }
 
@@ -192,12 +219,23 @@ void ColorRegionDetector::loadParameters()
   pnh_.param("merge_max_angle_diff_deg", merge_max_angle_diff_deg_, 15.0);
   pnh_.param("merge_max_region_gap_n", merge_max_region_gap_n_, 0.1);
 
+  pnh_.param("mask_filter_alpha", mask_filter_alpha_, 0.0);
+
+  pnh_.param("enable_error_stats", enable_error_stats_, true);
+  pnh_.param("error_stats_window", error_stats_window_, 100);
+
   pnh_.param("image_scale", image_scale_, 0.5);
   pnh_.param("use_tf_target_angle", use_tf_target_angle_, true);
   pnh_.param("target_angle", target_angle_, -M_PI / 2.0);
   pnh_.param("roi_y_ratio", roi_y_ratio_, 0.75);
   pnh_.param("roi_y", roi_y_, -1);
+  pnh_.param("roi_bottom_ratio", roi_bottom_ratio_, 0.5);
   pnh_.param("look_ahead_m", look_ahead_m_, 0.0);
+
+  pnh_.param("guide_line_width_m", guide_line_width_m_, 0.10);
+  pnh_.param("obb_width_tolerance_m", obb_width_tolerance_m_, 0.05);
+  pnh_.param("obb_max_outlier_ratio", obb_max_outlier_ratio_, 0.30);
+  pnh_.param("obb_min_ground_points", obb_min_ground_points_, 10);
   pnh_.param<std::string>("guide_line_estimator_type",
                           guide_line_estimator_type_,
                           "DepthGuideLineEstimator");
@@ -214,6 +252,32 @@ void ColorRegionDetector::loadParameters()
   {
     ROS_WARN("roi_y_ratio must be in [0, 1], reset to 0.75");
     roi_y_ratio_ = 0.75;
+  }
+  if (roi_bottom_ratio_ < 0.0 || roi_bottom_ratio_ > 1.0)
+  {
+    ROS_WARN("roi_bottom_ratio must be in [0, 1], reset to 0.5");
+    roi_bottom_ratio_ = 0.5;
+  }
+
+  if (guide_line_width_m_ <= 0.0)
+  {
+    ROS_WARN("guide_line_width_m must be > 0, reset to 0.10");
+    guide_line_width_m_ = 0.10;
+  }
+  if (obb_width_tolerance_m_ < 0.0)
+  {
+    ROS_WARN("obb_width_tolerance_m must be >= 0, reset to 0.05");
+    obb_width_tolerance_m_ = 0.05;
+  }
+  if (obb_max_outlier_ratio_ < 0.0 || obb_max_outlier_ratio_ > 1.0)
+  {
+    ROS_WARN("obb_max_outlier_ratio must be in [0, 1], reset to 0.30");
+    obb_max_outlier_ratio_ = 0.30;
+  }
+  if (obb_min_ground_points_ < 2)
+  {
+    ROS_WARN("obb_min_ground_points must be >= 2, reset to 10");
+    obb_min_ground_points_ = 10;
   }
 
   if (morph_kernel_size_ > 0 && morph_kernel_size_ % 2 == 0)
@@ -251,8 +315,26 @@ void ColorRegionDetector::loadParameters()
     merge_max_region_gap_n_ = 0.1;
   }
 
+  if (mask_filter_alpha_ < 0.0)
+  {
+    ROS_WARN("mask_filter_alpha must be >= 0, reset to 0.0");
+    mask_filter_alpha_ = 0.0;
+  }
+  if (mask_filter_alpha_ > 1.0)
+  {
+    ROS_WARN("mask_filter_alpha must be <= 1.0, reset to 1.0");
+    mask_filter_alpha_ = 1.0;
+  }
+
+  if (error_stats_window_ < 1)
+  {
+    ROS_WARN("error_stats_window must be >= 1, reset to 100");
+    error_stats_window_ = 100;
+  }
+
   if (guide_line_estimator_type_ != "FitLineGuideLineEstimator" &&
-      guide_line_estimator_type_ != "DepthGuideLineEstimator")
+      guide_line_estimator_type_ != "DepthGuideLineEstimator" &&
+      guide_line_estimator_type_ != "RectangleGuideLineEstimator")
   {
     ROS_WARN("Unknown guide_line_estimator_type '%s', using DepthGuideLineEstimator",
              guide_line_estimator_type_.c_str());
@@ -341,6 +423,29 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
   }
 
   cv::Mat mask = createColorMask(*proc_image);
+
+  // Temporal smoothing of the binary mask to reduce HSV segmentation jitter
+  // for stationary cameras.  alpha=0 disables it.
+  if (mask_filter_alpha_ > 0.0)
+  {
+    if (mask_accumulator_.empty() ||
+        mask_accumulator_.size() != mask.size() ||
+        mask_accumulator_.type() != CV_32F)
+    {
+      mask_accumulator_ = cv::Mat(mask.size(), CV_32F, cv::Scalar(0.0));
+    }
+
+    cv::Mat float_mask;
+    mask.convertTo(float_mask, CV_32F, 1.0 / 255.0);
+    cv::addWeighted(mask_accumulator_, 1.0 - mask_filter_alpha_,
+                    float_mask, mask_filter_alpha_, 0.0,
+                    mask_accumulator_);
+
+    // Convert back to binary: accumulator > 0.5 -> 255, else 0.
+    mask_accumulator_.convertTo(mask, CV_8U, 255.0);
+    cv::threshold(mask, mask, 127, 255, cv::THRESH_BINARY);
+  }
+
   applyMorphology(mask);
 
   std::vector<std::vector<cv::Point>> contours;
@@ -423,10 +528,11 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
   else
   {
     // Sort candidate groups so that the most reliable one is tried first.
-    // We prioritize groups whose lowest point is in the bottom half of the
+    // We prioritize groups whose lowest point is in the bottom part of the
     // image (near the robot), and among those we pick the longest one.  If no
     // bottom group succeeds, we fall back to upper groups sorted by bottom-y.
-    const double bottom_threshold = proc_image->rows * 0.5;
+    // The bottom region threshold is configurable via roi_bottom_ratio_.
+    const double bottom_threshold = proc_image->rows * roi_bottom_ratio_;
 
     struct GroupScore
     {
@@ -531,6 +637,7 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
 
   if (error_msg.valid)
   {
+    updateErrorStats(error_msg);
     ROS_INFO_THROTTLE(1.0,
                       "[Frame %d] GuideLineError OK: "
                       "yaw=%.4f rad (%.1f deg), lat_n=%.4f, lat_m=%.4f, "
@@ -561,13 +668,18 @@ void ColorRegionDetector::processFrame(const sensor_msgs::ImageConstPtr& rgb_msg
   }
 
   ROS_DEBUG_THROTTLE(1.0,
-                    "[Frame %d] Detection: image=%dx%d scale=%.2f, "
-                    "raw_contours=%zu, groups=%zu, valid_2d=%zu, "
-                    "filtered=%d, scaled_min_length=%.1f, largest_length=%.1f",
-                    frame_counter_,
-                    proc_image->cols, proc_image->rows, image_scale_,
-                    contours.size(), groups.size(), contour_array.contours.size(),
-                    filtered_count, scaled_min_length, largest_length);
+                     "[Frame %d] Detection: image=%dx%d scale=%.2f, "
+                     "raw_contours=%zu, groups=%zu, valid_2d=%zu, "
+                     "filtered=%d, scaled_min_length=%.1f, largest_length=%.1f",
+                     frame_counter_,
+                     proc_image->cols, proc_image->rows, image_scale_,
+                     contours.size(), groups.size(), contour_array.contours.size(),
+                     filtered_count, scaled_min_length, largest_length);
+
+  if (enable_error_stats_)
+  {
+    drawErrorStatsOverlay(annotated, error_msg);
+  }
 
   publishResults(rgb_msg->header, mask, annotated, contour_array);
 }
@@ -1036,6 +1148,130 @@ void ColorRegionDetector::drawContourOnImage(cv::Mat& annotated,
   const cv::Scalar bbox_color = is_merged ? cv::Scalar(255, 0, 255)
                                           : cv::Scalar(255, 0, 0);
   cv::rectangle(annotated, bbox, bbox_color, 2);
+}
+
+void ColorRegionDetector::updateErrorStats(const GuideLineError& error)
+{
+  if (!error.valid)
+  {
+    return;
+  }
+
+  yaw_error_history_.push_back(error.yaw_error);
+  if (yaw_error_history_.size() > static_cast<size_t>(error_stats_window_))
+  {
+    yaw_error_history_.pop_front();
+  }
+
+  // Use lateral_error_m when available (Depth / Rectangle mode), otherwise lateral_error_n.
+  const double lateral = (guide_line_estimator_type_ == "DepthGuideLineEstimator" ||
+                          guide_line_estimator_type_ == "RectangleGuideLineEstimator")
+                             ? error.lateral_error_m
+                             : error.lateral_error_n;
+  lateral_error_history_.push_back(lateral);
+  if (lateral_error_history_.size() > static_cast<size_t>(error_stats_window_))
+  {
+    lateral_error_history_.pop_front();
+  }
+}
+
+void ColorRegionDetector::drawErrorStatsOverlay(cv::Mat& annotated,
+                                                const GuideLineError& error) const
+{
+  if (annotated.empty())
+  {
+    return;
+  }
+
+  const int font = cv::FONT_HERSHEY_SIMPLEX;
+  const double font_scale = 0.5;
+  const int thickness = 1;
+  const int line_height = static_cast<int>(20 * (font_scale / 0.5));
+  const cv::Scalar text_color(0, 255, 0);  // Green
+  const cv::Scalar bg_color(0, 0, 0);      // Black background
+  const int margin = 10;
+  const int x = margin;
+  int y = margin + line_height;
+
+  auto draw_line = [&](const std::string& text)
+  {
+    int baseline = 0;
+    cv::Size text_size = cv::getTextSize(text, font, font_scale, thickness, &baseline);
+    cv::rectangle(annotated,
+                  cv::Point(x - 2, y - text_size.height - 2),
+                  cv::Point(x + text_size.width + 4, y + 2),
+                  bg_color, -1);
+    cv::putText(annotated, text, cv::Point(x, y), font, font_scale,
+                text_color, thickness, cv::LINE_AA);
+    y += line_height;
+  };
+
+  const std::string lat_unit =
+      (guide_line_estimator_type_ == "DepthGuideLineEstimator" ||
+       guide_line_estimator_type_ == "RectangleGuideLineEstimator")
+          ? "m"
+          : "n";
+
+  draw_line("Error statistics (window=" + std::to_string(error_stats_window_) + ")");
+
+  if (error.valid)
+  {
+    draw_line(cv::format("yaw:  %.2f deg", error.yaw_error * 180.0 / M_PI));
+  }
+  else
+  {
+    draw_line("yaw:  --");
+  }
+
+  if (!yaw_error_history_.empty())
+  {
+    const double min_yaw = *std::min_element(yaw_error_history_.begin(),
+                                             yaw_error_history_.end());
+    const double max_yaw = *std::max_element(yaw_error_history_.begin(),
+                                             yaw_error_history_.end());
+    const double avg_yaw = std::accumulate(yaw_error_history_.begin(),
+                                           yaw_error_history_.end(), 0.0) /
+                           yaw_error_history_.size();
+    draw_line(cv::format("yaw  min/max/avg: %.2f / %.2f / %.2f deg",
+                         min_yaw * 180.0 / M_PI,
+                         max_yaw * 180.0 / M_PI,
+                         avg_yaw * 180.0 / M_PI));
+  }
+  else
+  {
+    draw_line("yaw  min/max/avg: -- / -- / --");
+  }
+
+  if (error.valid)
+  {
+    const double lateral =
+        (guide_line_estimator_type_ == "DepthGuideLineEstimator" ||
+         guide_line_estimator_type_ == "RectangleGuideLineEstimator")
+            ? error.lateral_error_m
+            : error.lateral_error_n;
+    draw_line(cv::format("lat:  %.4f %s", lateral, lat_unit.c_str()));
+  }
+  else
+  {
+    draw_line("lat:  --");
+  }
+
+  if (!lateral_error_history_.empty())
+  {
+    const double min_lat = *std::min_element(lateral_error_history_.begin(),
+                                             lateral_error_history_.end());
+    const double max_lat = *std::max_element(lateral_error_history_.begin(),
+                                             lateral_error_history_.end());
+    const double avg_lat = std::accumulate(lateral_error_history_.begin(),
+                                           lateral_error_history_.end(), 0.0) /
+                           lateral_error_history_.size();
+    draw_line(cv::format("lat  min/max/avg: %.4f / %.4f / %.4f %s",
+                         min_lat, max_lat, avg_lat, lat_unit.c_str()));
+  }
+  else
+  {
+    draw_line("lat  min/max/avg: -- / -- / --");
+  }
 }
 
 void ColorRegionDetector::publishResults(const std_msgs::Header& header,

@@ -1,4 +1,4 @@
-> **注意**：本文档描述当前可插拔引导线估计版本。默认使用 `DepthGuideLineEstimator`（地平面 3D 拟合），同时保留 `FitLineGuideLineEstimator`（RGB-only 图像平面拟合）作为备选。Depth 模式所需的地面平面来源通过 `IGroundPlaneProvider` 接口解耦，支持话题订阅或 IMU 重力估计。
+> **注意**：本文档描述当前可插拔引导线估计版本。默认使用 `DepthGuideLineEstimator`（地平面 3D 拟合），`RectangleGuideLineEstimator`（地平面 OBB 矩形中心轴）作为抖动/不规则场景备选，同时保留 `FitLineGuideLineEstimator`（RGB-only 图像平面拟合）。Depth 模式所需的地面平面来源通过 `IGroundPlaneProvider` 接口解耦，支持话题订阅或 IMU 重力估计。
 
 # color_region_detector 算法逻辑说明
 
@@ -29,7 +29,8 @@
     │  ├─ TF 自动计算 target_angle（启动一次）
     │  ├─ 依次调用 IGuideLineEstimator::estimate()，直到成功
     │  │    ├─ FitLine: 归一化图像平面 + cv::fitLine
-    │  │    └─ Depth: 反投影 + 地平面 PCA 直线
+    │  │    ├─ Depth: 反投影 + 地平面 PCA 直线
+    │  │    └─ Rectangle: 反投影 + 地平面 OBB 矩形中心轴
     │  ├─ 计算 yaw_error / lateral_error_n / lateral_error_m
     │  └─ 绘制标注图并发布
     ▼
@@ -194,6 +195,38 @@ void ColorRegionDetector::applyMorphology(cv::Mat& mask)
 - 再进行**闭运算**（Close）：先膨胀后腐蚀，用于填补目标区域内部的小孔洞。
 - 如果 `morph_kernel_size` 设为 0，则跳过形态学处理。
 
+### 5.1 HSV 掩码时间滤波
+
+源码：`src/color_region_detector.cpp` → `processFrame()`
+
+```cpp
+if (mask_filter_alpha_ > 0.0)
+{
+  if (mask_accumulator_.empty() ||
+      mask_accumulator_.size() != mask.size() ||
+      mask_accumulator_.type() != CV_32F)
+  {
+    mask_accumulator_ = cv::Mat(mask.size(), CV_32F, cv::Scalar(0.0));
+  }
+
+  cv::Mat float_mask;
+  mask.convertTo(float_mask, CV_32F, 1.0 / 255.0);
+  cv::addWeighted(mask_accumulator_, 1.0 - mask_filter_alpha_,
+                  float_mask, mask_filter_alpha_, 0.0,
+                  mask_accumulator_);
+
+  mask_accumulator_.convertTo(mask, CV_8U, 255.0);
+  cv::threshold(mask, mask, 127, 255, cv::THRESH_BINARY);
+}
+```
+
+**逻辑说明**：
+- 在 HSV 阈值分割之后、形态学处理之前，对二值掩码做指数滑动平均（EMA）。
+- 历史掩码权重为 `1 - alpha`，当前帧权重为 `alpha`。
+- 当 `alpha = 0.0` 时关闭滤波；`alpha` 越大，当前帧占比越高，响应越快但平滑越弱。
+- 对于静止/缓慢变化的相机，推荐 `0.1 ~ 0.3`，可显著抑制 HSV 分割的帧间抖动。
+- 建议搭配形态学处理（如 `morph_kernel_size: 5`）进一步去除剩余孤点。
+
 ---
 
 ## 6. 轮廓检测与过滤
@@ -300,6 +333,13 @@ bool ColorRegionDetector::buildContourInfo(const std::vector<cv::Point>& contour
 - 对每组调用 `IGuideLineEstimator::estimate()`，直到某组返回有效结果。
 - 若所有组都失败，最终输出 `GuideLineError invalid`。
 - 该策略能自动避开地平线、墙面等远处的长条状误检，优先使用离机器人最近的地面引导线。
+
+**底部区域判定**：
+- 通过 `roi_bottom_ratio` 控制。
+- 只有当组合中所有轮廓的包围盒最低点 `bottom_y >= roi_bottom_ratio * image_height` 时，才被认为是“底部候选组”。
+- 底部候选组按 `bottom_y` 从大到小排序（先最近），内部再按轮廓总长度从长到短排序。
+- 非底部候选组作为兜底，也按 `bottom_y` 从大到小排序。
+- `roi_bottom_ratio = 0.5` 表示只看图像下半部分；`0.0` 表示整图都参与；`0.75` 表示只看最下方四分之一区域。
 
 ### 7.2 矩形近似（仅可视化）
 
@@ -423,7 +463,24 @@ double yaw_error = (abs(error1) < abs(error2)) ? error1 : error2;
    ```
    其中 `look_ahead_reference = -d * normal + look_ahead_m * forward`，即相机光心在地平面的投影再向前 `look_ahead_m` 米。
 
-### 7.9 IGroundPlaneProvider 地面平面来源
+### 7.9 RectangleGuideLineEstimator 地平面 OBB 拟合
+
+源码：`src/rectangle_guide_line_estimator.cpp`
+
+当 `guide_line_estimator_type: "RectangleGuideLineEstimator"` 时，算法流程与 `DepthGuideLineEstimator` 前 3 步相同（地面平面、反投影、地面交点），区别在第 4 步：
+
+4. **OBB 矩形拟合**：
+   - 计算地面点云质心。
+   - 对地面点云做 PCA，取最大特征值方向为**长轴**（引导线方向），中间特征值方向为**短轴**（线宽方向）。
+   - 用长轴/短轴包围所有地面点，得到 OBB 矩形。
+   - 矩形中心作为线上参考点，长轴作为中心轴。
+5. **宽度软校验**：比较实际短轴宽度与 `guide_line_width_m`，偏差大时打印 WARN，但不拒绝结果。
+6. **方向对齐**：与 Depth 模式相同，对齐车辆前向。
+7. **误差计算**：与 Depth 模式相同，使用 `lateral_error_m`。
+
+详细说明见 `docs/rectangle_guide_line_estimator.md`。
+
+### 7.10 IGroundPlaneProvider 地面平面来源
 
 源码：
 - `include/gemini_geometry_detector/ground_plane_provider_interface.h`
@@ -433,14 +490,14 @@ double yaw_error = (abs(error1) < abs(error2)) ? error1 : error2;
 #### TopicGroundPlaneProvider
 
 - 订阅 `ground_plane_topic`（默认 `/ground_plane/coefficients`）。
-- 每次收到 `PlaneCoefficients` 后解包为 `(normal, d)` 并回调给 `DepthGuideLineEstimator`。
+- 每次收到 `PlaneCoefficients` 后解包为 `(normal, d)` 并回调给 `DepthGuideLineEstimator` 或 `RectangleGuideLineEstimator`。
 
 #### ImuGroundPlaneProvider
 
 - 订阅 `imu_topic`（默认 `/camera/gyro_accel/sample`）。
 - 对 IMU 重力做低通滤波，并按 `imu_to_camera_qx/qy/qz/qw` 旋转到相机坐标系。
 - 计算地面法向量 `normal = -gravity.normalized()`，取 `d = camera_height`。
-- 每次 IMU 回调都通过回调把平面传给 `DepthGuideLineEstimator`。
+- 每次 IMU 回调都通过回调把平面传给当前使用的 Depth/Rectangle estimator。
 
 **逻辑说明**：
 - 控制量直接是车体坐标系下的角度和米制横向偏移，便于下游控制器直接使用。
@@ -466,7 +523,28 @@ double yaw_error = (abs(error1) < abs(error2)) ? error1 : error2;
 - 品红色线段：连接图像中心与 ROI 交点，直观表示横向误差。
 - 文字：`yaw: X.XXX rad`、`lat: X.XXXX`。
 
-### 8.2 发布结果
+### 8.2 误差统计叠加
+
+源码：`src/color_region_detector.cpp` → `updateErrorStats()` / `drawErrorStatsOverlay()`
+
+当 `enable_error_stats: true` 时，每次得到有效的 `GuideLineError` 后都会更新滑动窗口统计，并在 `annotated` 图像左上角叠加文字：
+
+```text
+Error statistics (window=100)
+yaw:  3.00 deg
+yaw  min/max/avg: -7.07 / 10.75 / 1.98 deg
+lat:  0.0234 m
+lat  min/max/avg: -0.0543 / 0.0821 / 0.0123 m
+```
+
+**逻辑说明**：
+- 只统计 `valid = true` 的帧。
+- 滑动窗口大小由 `error_stats_window` 控制，默认保存最近 100 帧。
+- 横向误差在 `DepthGuideLineEstimator` 模式下使用 `lateral_error_m`，在 `FitLineGuideLineEstimator` 模式下使用 `lateral_error_n`。
+- 统计量包括：当前值、最小值、最大值、均值。
+- 背景使用黑色半透明矩形，文字为绿色，便于在 RViz 中查看。
+
+### 8.3 发布结果
 
 源码：`src/color_region_detector.cpp` → `publishResults()`
 
@@ -522,6 +600,10 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `enable_contour_merging` | false | 是否启用断裂轮廓合并 |
 | `merge_max_angle_diff_deg` | 15.0 | 合并方向角差异阈值（°） |
 | `merge_max_region_gap_n` | 0.1 | 合并包围盒最近归一化距离阈值 |
+| `mask_filter_alpha` | 0.0 | HSV 掩码时间滤波系数（0.0 关闭；0.1~0.3 推荐） |
+| `roi_bottom_ratio` | 0.5 | 轮廓组“底部”判定阈值：包围盒最低点低于该比例图像高度才算底部候选 |
+| `enable_error_stats` | true | 是否在 annotated 图上叠加误差统计 |
+| `error_stats_window` | 100 | 误差统计滑动窗口帧数 |
 | `image_scale` | 0.5 | 颜色检测和引导线拟合的图像缩放比例 |
 | `use_tf_target_angle` | true | 是否通过 TF 自动计算 `target_angle` |
 | `target_angle` | `0.0` / `-pi/2` | 目标线方向（rad），TF 失败时作为回退；Depth 模式为地平面相对车体前向的角，FitLine 模式为图像平面角 |
@@ -529,14 +611,18 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `camera_frame` | `camera_color_optical_frame` | 相机光心坐标系 |
 | `roi_y_ratio` | 0.75 | ROI 行相对图像高度的比例（FitLine 模式） |
 | `roi_y` | -1 | ROI 行绝对像素值，`-1` 表示使用 `roi_y_ratio`（FitLine 模式） |
-| `guide_line_estimator_type` | `DepthGuideLineEstimator` | 引导线估计算法 |
-| `look_ahead_m` | 0.0 | Depth 模式下前视参考点距离（m） |
-| `ground_plane_provider_type` | `topic` | 地面平面来源：`topic` / `imu` |
+| `guide_line_estimator_type` | `DepthGuideLineEstimator` | 引导线估计算法：`DepthGuideLineEstimator` / `RectangleGuideLineEstimator` / `FitLineGuideLineEstimator` |
+| `look_ahead_m` | 0.0 | Depth / Rectangle 模式下前视参考点距离（m） |
+| `ground_plane_provider_type` | `topic` | 地面平面来源：`topic` / `imu`（Depth / Rectangle 模式使用） |
 | `ground_plane_topic` | `ground_plane/coefficients` | topic provider 订阅话题 |
 | `imu_topic` | `/camera/gyro_accel/sample` | imu provider 订阅话题 |
 | `camera_height` | 0.8 | imu provider 相机高度（m） |
 | `gravity_filter_alpha` | 1.0 | imu provider 重力低通滤波系数 |
 | `imu_to_camera_qx/qy/qz/qw` | 0/0/0/1 | imu provider IMU→相机旋转 |
+| `guide_line_width_m` | 0.10 | Rectangle 模式下引导线物理宽度（m） |
+| `obb_width_tolerance_m` | 0.05 | Rectangle 模式下宽度偏差告警阈值（m） |
+| `obb_max_outlier_ratio` | 0.30 | Rectangle 模式下离群点比例告警阈值 |
+| `obb_min_ground_points` | 10 | Rectangle 模式下最少有效地面点数 |
 
 ---
 
@@ -556,6 +642,13 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 - 目标区域内部有黑色空洞 → 保持闭运算，可适度增大核。
 - 目标本身很小 → 不要设置太大的核，以免把目标腐蚀掉。
 
+### 11.2.1 HSV 掩码时间滤波调节
+
+- 掩码帧间抖动明显 → 增大 `mask_filter_alpha`（越接近 1.0 响应越快）。
+- 静止相机下推荐从 `0.15` 开始尝试。
+- 相机快速移动时 → 关闭或保持较小值（如 `0.05`），避免历史掩码拖尾。
+- 滤波后仍有孤点 → 配合 `morph_kernel_size` 开运算。
+
 ### 11.3 长度过滤调节
 
 - 误检太多短线段 → 增大 `min_contour_length`。
@@ -574,6 +667,18 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 - 引导线方向不对 → 调整 `target_angle`。
 - 横向误差响应过晚 → 增大 `roi_y_ratio`（更靠近图像底部）。
 - 横向误差噪声大 → 减小 `roi_y_ratio`（更远离车辆，线更稳定），但响应会滞后。
+
+### 11.6 底部区域阈值调节
+
+- 地平线/远处背景误检被优先选中 → 增大 `roi_bottom_ratio`（如 0.6~0.7），限制只看更靠近底部的区域。
+- 引导线在画面中位置偏上、底部组太少 → 减小 `roi_bottom_ratio`（如 0.3~0.4）。
+- 想完全按底部远近选择，不限制高度 → 设为 `0.0`。
+
+### 11.7 误差统计叠加调节
+
+- 不需要显示统计 → `enable_error_stats: false`。
+- 窗口太短、统计跳动 → 增大 `error_stats_window`（如 200~500）。
+- 窗口太长、响应迟钝 → 减小 `error_stats_window`（如 30~50）。
 
 ---
 
@@ -601,6 +706,7 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `msg/ContourInfo.msg` / `ContourArray.msg` | 2D 轮廓消息 |
 | `msg/GuideLineError.msg` | 引导线误差消息 |
 | `docs/depth_guide_line_estimator.md` | DepthGuideLineEstimator 反投影与误差计算详细说明 |
+| `docs/rectangle_guide_line_estimator.md` | RectangleGuideLineEstimator OBB 中心轴详细说明 |
 
 ---
 

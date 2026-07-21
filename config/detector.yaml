@@ -17,7 +17,7 @@ morph_kernel_size: 7
 # Minimum contour length (arc length) in pixels to be considered valid.
 # A thin horizontal line has a very small area but can still be long, so using
 # arc length instead of area avoids filtering it out.
-min_contour_length: 40
+min_contour_length: 50
 
 # Maximum number of contour points to use for line fitting and publishing
 # (0 = all, downsample if >0)
@@ -33,9 +33,33 @@ max_aspect_ratio: 0.0
 # When enabled, valid contours are grouped by direction and normalized
 # bounding-box nearest distance; each group is concatenated into an additional
 # merged contour.
-enable_contour_merging: true
-merge_max_angle_diff_deg: 5.0
+enable_contour_merging: false
+merge_max_angle_diff_deg: 15.0
 merge_max_region_gap_n: 0.1
+
+# Temporal smoothing of the HSV binary mask (exponential moving average).
+# Range: [0.0, 1.0].  0.0 disables smoothing.  Larger values make the mask
+# respond faster but smooth less.  For a stationary camera, 0.1~0.3 is a good
+# starting point to suppress HSV segmentation jitter.
+mask_filter_alpha: 0.2
+
+# Bottom-region threshold for contour group priority.
+# Only contour groups whose lowest bounding-box edge is below this fraction of
+# the image height are considered "bottom" candidates and tried first (bottom-up
+# order).  0.5 means the lower half of the image; 0.0 means the whole image.
+roi_bottom_ratio: 0.4
+
+# Error statistics overlay on the annotated image.
+# Displays current / min / max / avg of yaw_error and lateral_error.
+enable_error_stats: true
+error_stats_window: 100
+
+# OBB-based guide-line estimator parameters (only used when
+# guide_line_estimator_type is "RectangleGuideLineEstimator").
+guide_line_width_m: 0.10       # Expected physical width of the guide line (m)
+obb_width_tolerance_m: 0.05    # Tolerance for width mismatch warnings (m)
+obb_max_outlier_ratio: 0.30    # Max ratio of points outside the expected band
+obb_min_ground_points: 10      # Minimum ground-plane points to fit the rectangle
 
 
 # Image scale for color detection and guide-line estimation
@@ -69,9 +93,9 @@ roi_y: -1
 
 # Guide-line estimator implementation.
 # - "DepthGuideLineEstimator": back-project to ground plane using depth/camera intrinsics
-#   and an external ground plane (default).
+#   and an external ground plane (default). RectangleGuideLineEstimator
 # - "FitLineGuideLineEstimator": pure RGB image-plane fitting.
-guide_line_estimator_type: "DepthGuideLineEstimator"
+guide_line_estimator_type: "RectangleGuideLineEstimator"
 
 # Distance ahead of the camera origin on the ground plane at which to evaluate
 # lateral error (meters). Only used by DepthGuideLineEstimator.
