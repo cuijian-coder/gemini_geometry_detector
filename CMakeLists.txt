@@ -8,6 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   sensor_msgs
   std_msgs
+  std_srvs
   geometry_msgs
   cv_bridge
   image_transport
@@ -39,6 +40,7 @@ catkin_package(
     roscpp
     sensor_msgs
     std_msgs
+    std_srvs
     geometry_msgs
     cv_bridge
     image_transport
@@ -64,6 +66,7 @@ add_executable(color_region_detector_node
   src/rectangle_guide_line_estimator.cpp
   src/topic_ground_plane_provider.cpp
   src/imu_ground_plane_provider.cpp
+  src/imu_gravity_estimator.cpp
 )
 
 add_dependencies(color_region_detector_node

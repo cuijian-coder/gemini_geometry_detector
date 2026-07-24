@@ -95,7 +95,7 @@ roi_y: -1
 # - "DepthGuideLineEstimator": back-project to ground plane using depth/camera intrinsics
 #   and an external ground plane (default). RectangleGuideLineEstimator
 # - "FitLineGuideLineEstimator": pure RGB image-plane fitting.
-guide_line_estimator_type: "RectangleGuideLineEstimator"
+guide_line_estimator_type: "DepthGuideLineEstimator"
 
 # Distance ahead of the camera origin on the ground plane at which to evaluate
 # lateral error (meters). Only used by DepthGuideLineEstimator.
@@ -113,6 +113,16 @@ ground_plane_topic: "ground_plane/coefficients"
 imu_topic: "/camera/gyro_accel/sample"
 camera_height: 0.14
 gravity_filter_alpha: 1.0
+
+# IMU sampling mode.
+#   <= 0 : continuous mode (low-pass filter every IMU message, never unsubscribe).
+#   >  0 : sample-average mode. Collect this many valid IMU messages, average
+#          them to estimate gravity, then unsubscribe from IMU topic.
+imu_sample_count: 10
+
+# Enable /resample_imu_ground_plane service to trigger re-sampling at runtime.
+imu_enable_resample_service: true
+
 imu_to_camera_qx: 0.0
 imu_to_camera_qy: 0.0
 imu_to_camera_qz: 0.0

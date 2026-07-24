@@ -311,6 +311,8 @@ roi_point.z = ref_point.z;
 | `imu_topic` | `/camera/gyro_accel/sample` | imu provider 订阅话题 |
 | `camera_height` | `0.14` | imu provider 相机高度（m） |
 | `gravity_filter_alpha` | `1.0` | imu provider 重力低通滤波系数 |
+| `imu_sample_count` | `0` | imu 采样次数，`<=0` 连续模式，`>0` 采样平均后取消订阅 |
+| `imu_enable_resample_service` | `true` | 是否启用 `/resample_imu_ground_plane` service |
 | `imu_to_camera_qx/qy/qz/qw` | `0/0/0/1` | imu provider IMU→相机旋转 |
 
 > 轮廓过滤参数（`min_contour_length`、`min_aspect_ratio`、`enable_contour_merging` 等）在 `color_region_detector` 中处理，详见 `docs/color_region_detector.md`。
@@ -323,6 +325,7 @@ roi_point.z = ref_point.z;
 
 - 有 `ground_plane_calibrator` 标定的话题 → `ground_plane_provider_type: topic`。
 - 只有 IMU 且相机高度固定 → `ground_plane_provider_type: imu`，并准确配置 `camera_height` 和 `imu_to_camera_q`。
+- 需要 IMU 采样平均模式 → `imu_sample_count: 30`，采样完成后自动取消订阅；如需重新采样可调用 `/gemini_geometry_detector/resample_imu_ground_plane`。
 
 ### 9.2 target_angle 调节
 

@@ -494,10 +494,22 @@ double yaw_error = (abs(error1) < abs(error2)) ? error1 : error2;
 
 #### ImuGroundPlaneProvider
 
-- 订阅 `imu_topic`（默认 `/camera/gyro_accel/sample`）。
+源码：
+- `src/imu_ground_plane_provider.cpp`
+- `src/imu_gravity_estimator.cpp`
+
+内部把 IMU 重力估计逻辑委托给 `ImuGravityEstimator` 类，自身只负责把重力方向转成 `(normal, d)` 并传给 estimator。
+
+工作模式由 `imu_sample_count` 控制：
+
+| 模式 | `imu_sample_count` | 行为 |
+|---|---|---|
+| 连续模式 | `<= 0` | 每条有效 IMU 都更新低通滤波重力，持续订阅 |
+| 采样平均模式 | `> 0` | 收集前 N 条有效 IMU 做平均，得到重力后调用一次 setGroundPlane，然后取消订阅 |
+
+- 采样完成后可通过 service `/gemini_geometry_detector/resample_imu_ground_plane` 触发重新采样。
 - 对 IMU 重力做低通滤波，并按 `imu_to_camera_qx/qy/qz/qw` 旋转到相机坐标系。
 - 计算地面法向量 `normal = -gravity.normalized()`，取 `d = camera_height`。
-- 每次 IMU 回调都通过回调把平面传给当前使用的 Depth/Rectangle estimator。
 
 **逻辑说明**：
 - 控制量直接是车体坐标系下的角度和米制横向偏移，便于下游控制器直接使用。
@@ -618,6 +630,8 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `imu_topic` | `/camera/gyro_accel/sample` | imu provider 订阅话题 |
 | `camera_height` | 0.8 | imu provider 相机高度（m） |
 | `gravity_filter_alpha` | 1.0 | imu provider 重力低通滤波系数 |
+| `imu_sample_count` | 0 | imu 采样次数，`<=0` 连续模式，`>0` 采样平均后取消订阅 |
+| `imu_enable_resample_service` | true | 是否启用 `/resample_imu_ground_plane` service |
 | `imu_to_camera_qx/qy/qz/qw` | 0/0/0/1 | imu provider IMU→相机旋转 |
 | `guide_line_width_m` | 0.10 | Rectangle 模式下引导线物理宽度（m） |
 | `obb_width_tolerance_m` | 0.05 | Rectangle 模式下宽度偏差告警阈值（m） |
@@ -693,6 +707,7 @@ void ColorRegionDetector::publishResults(const std_msgs::Header& header,
 | `src/depth_guide_line_estimator.cpp` | 地平面 3D 引导线估计算法实现 |
 | `src/topic_ground_plane_provider.cpp` | 话题地面平面来源实现 |
 | `src/imu_ground_plane_provider.cpp` | IMU 地面平面来源实现 |
+| `src/imu_gravity_estimator.cpp` | IMU 重力方向估计实现 |
 | `include/gemini_geometry_detector/guide_line_estimator_interface.h` | 引导线估计算法接口 |
 | `include/gemini_geometry_detector/ground_plane_provider_interface.h` | 地面平面来源接口 |
 | `include/gemini_geometry_detector/fit_line_guide_line_estimator.h` | RGB 实现类声明 |
